@@ -1,0 +1,861 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Particle Heart Aggregation</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: dark; }
+
+    * { box-sizing: border-box; }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+    }
+
+    #scene {
+      display: block;
+      width: min(100vw, 177.7778vh);
+      aspect-ratio: 16 / 9;
+      background: #000;
+      cursor: grab;
+      touch-action: none;
+      user-select: none;
+    }
+
+    #scene:active { cursor: grabbing; }
+
+    #error {
+      position: fixed;
+      inset: auto 0 18px;
+      display: none;
+      color: #ddd;
+      font: 12px/1.4 system-ui, sans-serif;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="scene" aria-label="由地面粒子聚合形成的粉紫色粒子爱心"></canvas>
+  <div id="error" role="status"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script>
+    (() => {
+      "use strict";
+
+      const HEART_PARTICLES = 17600;
+      const GROUND_PARTICLES = 1100;
+      const PARTICLE_COUNT = HEART_PARTICLES + GROUND_PARTICLES;
+      const SHELL_COUNT = Math.floor(HEART_PARTICLES * 0.40);
+      const SURFACE_COUNT = Math.floor(HEART_PARTICLES * 0.30);
+      const TAU = Math.PI * 2;
+      const HALF_WIDTH = 80 / 9;
+      const HALF_HEIGHT = 5;
+      const HEART_CENTER_Y = 1.30;
+      const HEART_SCALE_X = 2.86;
+      const HEART_SCALE_Y = 1.88;
+      const HEART_SCALE_Z = 1.75;
+      const HEART_AUTO_TURNS = 3;
+      const HEART_ROTATION_START = 4.2;
+      const HEART_ROTATION_END = 13.2;
+
+      const canvas = document.getElementById("scene");
+      const errorMessage = document.getElementById("error");
+      const random = mulberry32(0x51a7c0de);
+
+      let renderer;
+      let scene;
+      let camera;
+      let particles;
+      let material;
+      let backgroundPlane;
+      let backgroundMaterial;
+      let backgroundStars;
+      let backgroundStarMaterial;
+      let backgroundGlows;
+      let backgroundGlowMaterial;
+      let startTime = 0;
+      let animationFrame = 0;
+      let photonAttraction = 0;
+      const pointerRotation = {
+        dragging: false,
+        pointerId: -1,
+        lastX: 0,
+        lastY: 0,
+        x: 0,
+        y: 0,
+        velocityX: 0,
+        velocityY: 0
+      };
+
+      function mulberry32(seed) {
+        return function seededRandom() {
+          let value = seed += 0x6D2B79F5;
+          value = Math.imul(value ^ value >>> 15, value | 1);
+          value ^= value + Math.imul(value ^ value >>> 7, value | 61);
+          return ((value ^ value >>> 14) >>> 0) / 4294967296;
+        };
+      }
+
+      function lerp(a, b, amount) {
+        return a + (b - a) * amount;
+      }
+
+      function heartVolumeField(x, y, z) {
+        const base = x * x + 2.25 * z * z + y * y - 1;
+        return base * base * base
+          - x * x * y * y * y
+          - 0.1125 * z * z * y * y * y;
+      }
+
+      function sampleHeartVolume() {
+        for (;;) {
+          const x = lerp(-1.22, 1.22, random());
+          const y = lerp(-1.08, 1.32, random());
+          const z = lerp(-0.78, 0.78, random());
+          if (heartVolumeField(x, y, z) <= 0) return { x, y, z };
+        }
+      }
+
+      function projectToHeartSurface(direction) {
+        let inside = 0;
+        let outside = 2.5;
+
+        for (let i = 0; i < 26; i++) {
+          const radius = (inside + outside) * 0.5;
+          const value = heartVolumeField(
+            direction.x * radius,
+            direction.y * radius,
+            direction.z * radius
+          );
+          if (value <= 0) inside = radius;
+          else outside = radius;
+        }
+
+        return {
+          x: direction.x * inside,
+          y: direction.y * inside,
+          z: direction.z * inside
+        };
+      }
+
+      function sampleHeartSurface(rimBiased) {
+        let x;
+        let y;
+        let z;
+
+        if (rimBiased) {
+          const angle = random() * TAU;
+          x = Math.cos(angle);
+          y = Math.sin(angle);
+          z = lerp(-0.20, 0.20, random());
+        } else {
+          y = lerp(-1, 1, random());
+          const ring = Math.sqrt(Math.max(0, 1 - y * y));
+          const angle = random() * TAU;
+          x = Math.cos(angle) * ring;
+          z = Math.sin(angle) * ring;
+        }
+
+        const length = Math.hypot(x, y, z);
+        return projectToHeartSurface({ x: x / length, y: y / length, z: z / length });
+      }
+
+      function makeTarget(index) {
+        let point;
+        let kind;
+
+        if (index < SHELL_COUNT) {
+          point = sampleHeartSurface(true);
+          kind = 0;
+        } else if (index < SHELL_COUNT + SURFACE_COUNT) {
+          point = sampleHeartSurface(false);
+          kind = 1;
+        } else {
+          point = sampleHeartVolume();
+          kind = 2;
+        }
+
+        return {
+          x: point.x * HEART_SCALE_X,
+          y: point.y * HEART_SCALE_Y + HEART_CENTER_Y,
+          z: point.z * HEART_SCALE_Z,
+          nx: point.x,
+          ny: point.y,
+          kind
+        };
+      }
+
+      function makeGroundPoint() {
+        const z = lerp(-2.15, 2.15, random());
+        const depth = (z + 2.15) / 4.3;
+        return {
+          x: lerp(-HALF_WIDTH * 0.99, HALF_WIDTH * 0.99, random()),
+          y: -4.78 + depth * 2.12 + (random() - 0.5) * 0.18,
+          z
+        };
+      }
+
+      function createRomanticBackground() {
+        backgroundMaterial = new THREE.ShaderMaterial({
+          transparent: false,
+          depthTest: false,
+          depthWrite: false,
+          uniforms: {
+            uTime: { value: 0 },
+            uAspect: { value: 16 / 9 }
+          },
+          vertexShader: `
+            varying vec2 vUv;
+
+            void main() {
+              vUv = uv;
+              gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+
+            uniform float uTime;
+            uniform float uAspect;
+            varying vec2 vUv;
+
+            float glow(vec2 uv, vec2 center, float radius) {
+              vec2 offset = uv - center;
+              offset.x *= uAspect;
+              return exp(-dot(offset, offset) / radius);
+            }
+
+            void main() {
+              vec2 uv = vUv;
+              float breathe = 0.96 + sin(uTime * 0.16) * 0.04;
+              float rose = glow(uv, vec2(0.50, 0.61), 0.092) * breathe;
+              float violetLeft = glow(uv, vec2(0.20, 0.50), 0.080);
+              float violetRight = glow(uv, vec2(0.82, 0.56), 0.070);
+              float horizon = exp(-pow((uv.y - 0.12) * 6.2, 2.0)) * 0.32;
+              vec3 color = vec3(0.0015, 0.0005, 0.0030);
+              color += vec3(0.065, 0.004, 0.050) * rose;
+              color += vec3(0.018, 0.004, 0.070) * (violetLeft + violetRight);
+              color += vec3(0.048, 0.012, 0.070) * horizon;
+              float vignette = smoothstep(0.95, 0.28, length((uv - 0.5) * vec2(1.05, 1.0)));
+              color *= mix(0.28, 1.0, vignette);
+              gl_FragColor = vec4(color, 1.0);
+            }
+          `
+        });
+
+        backgroundPlane = new THREE.Mesh(
+          new THREE.PlaneGeometry(32, 18),
+          backgroundMaterial
+        );
+        backgroundPlane.position.z = -8;
+        backgroundPlane.renderOrder = -10;
+        scene.add(backgroundPlane);
+
+        const count = 3600;
+        const positions = new Float32Array(count * 3);
+        const colors = new Float32Array(count * 3);
+        const sizes = new Float32Array(count);
+        const phases = new Float32Array(count);
+
+        for (let i = 0; i < count; i++) {
+          const offset = i * 3;
+          const avoidCenter = random() < 0.64;
+          let x;
+          let y;
+
+          do {
+            x = lerp(-8.7, 8.7, random());
+            y = lerp(-4.65, 4.65, random());
+          } while (avoidCenter && Math.abs(x) < 3.7 && y > -0.8 && y < 3.7);
+
+          positions[offset] = x;
+          positions[offset + 1] = y;
+          positions[offset + 2] = lerp(-5.8, -2.4, random());
+
+          const colorChoice = random();
+          if (colorChoice < 0.52) {
+            colors.set([0.50, 0.38, 0.72], offset);
+          } else if (colorChoice < 0.82) {
+            colors.set([0.72, 0.32, 0.68], offset);
+          } else {
+            colors.set([0.72, 0.72, 0.86], offset);
+          }
+          sizes[i] = lerp(0.65, 1.75, Math.pow(random(), 1.8));
+          phases[i] = random() * TAU;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute("aPhase", new THREE.BufferAttribute(phases, 1));
+
+        backgroundStarMaterial = new THREE.ShaderMaterial({
+          transparent: true,
+          depthTest: false,
+          depthWrite: false,
+          blending: THREE.NormalBlending,
+          uniforms: {
+            uTime: { value: 0 },
+            uPixelRatio: { value: renderer.getPixelRatio() }
+          },
+          vertexShader: `
+            attribute vec3 aColor;
+            attribute float aSize;
+            attribute float aPhase;
+            uniform float uTime;
+            uniform float uPixelRatio;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+              vec3 drifted = position;
+              drifted.y += sin(uTime * 0.10 + aPhase) * 0.035;
+              drifted.x += cos(uTime * 0.075 + aPhase) * 0.025;
+              vec4 viewPosition = modelViewMatrix * vec4(drifted, 1.0);
+              gl_Position = projectionMatrix * viewPosition;
+              gl_PointSize = aSize * uPixelRatio;
+              vColor = aColor;
+              vAlpha = 0.32 + (sin(uTime * 0.72 + aPhase) * 0.5 + 0.5) * 0.46;
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+              float distanceToCenter = length(gl_PointCoord - 0.5);
+              float alpha = (1.0 - smoothstep(0.12, 0.50, distanceToCenter)) * vAlpha;
+              if (alpha < 0.02) discard;
+              gl_FragColor = vec4(vColor, alpha);
+            }
+          `
+        });
+
+        backgroundStars = new THREE.Points(geometry, backgroundStarMaterial);
+        backgroundStars.renderOrder = -5;
+        backgroundStars.frustumCulled = false;
+        scene.add(backgroundStars);
+
+        const glowCount = 2600;
+        const glowPositions = new Float32Array(glowCount * 3);
+        const glowColors = new Float32Array(glowCount * 3);
+        const glowSizes = new Float32Array(glowCount);
+        const glowPhases = new Float32Array(glowCount);
+        const glowSpeeds = new Float32Array(glowCount);
+        const glowDepths = new Float32Array(glowCount);
+
+        for (let i = 0; i < glowCount; i++) {
+          const offset = i * 3;
+          const depth = random();
+          glowPositions[offset] = lerp(-9.2, 9.2, random());
+          glowPositions[offset + 1] = lerp(-4.9, 4.9, random());
+          glowPositions[offset + 2] = lerp(-5.6, -0.8, depth);
+
+          const colorChoice = random();
+          if (colorChoice < 0.42) {
+            glowColors.set([0.92, 0.20, 0.72], offset);
+          } else if (colorChoice < 0.76) {
+            glowColors.set([0.48, 0.20, 0.90], offset);
+          } else if (colorChoice < 0.92) {
+            glowColors.set([0.96, 0.52, 0.88], offset);
+          } else {
+            glowColors.set([0.82, 0.82, 1.0], offset);
+          }
+
+          if (depth < 0.58) {
+            glowSizes[i] = lerp(2.2, 4.6, random());
+          } else if (depth < 0.90) {
+            glowSizes[i] = lerp(4.4, 8.2, random());
+          } else {
+            glowSizes[i] = lerp(8.2, 14.5, random());
+          }
+          glowPhases[i] = random() * TAU;
+          glowSpeeds[i] = lerp(0.35, 1.35, random());
+          glowDepths[i] = depth;
+        }
+
+        const glowGeometry = new THREE.BufferGeometry();
+        glowGeometry.setAttribute("position", new THREE.BufferAttribute(glowPositions, 3));
+        glowGeometry.setAttribute("aColor", new THREE.BufferAttribute(glowColors, 3));
+        glowGeometry.setAttribute("aSize", new THREE.BufferAttribute(glowSizes, 1));
+        glowGeometry.setAttribute("aPhase", new THREE.BufferAttribute(glowPhases, 1));
+        glowGeometry.setAttribute("aSpeed", new THREE.BufferAttribute(glowSpeeds, 1));
+        glowGeometry.setAttribute("aDepth", new THREE.BufferAttribute(glowDepths, 1));
+
+        backgroundGlowMaterial = new THREE.ShaderMaterial({
+          transparent: true,
+          depthTest: false,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          uniforms: {
+            uTime: { value: 0 },
+            uPixelRatio: { value: renderer.getPixelRatio() },
+            uHeartRotation: { value: 0 },
+            uAttraction: { value: 0 }
+          },
+          vertexShader: `
+            attribute vec3 aColor;
+            attribute float aSize;
+            attribute float aPhase;
+            attribute float aSpeed;
+            attribute float aDepth;
+            uniform float uTime;
+            uniform float uPixelRatio;
+            uniform float uHeartRotation;
+            uniform float uAttraction;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+              vec3 drifted = position;
+              float horizontalSpan = 18.4;
+              float verticalSpan = 9.8;
+              float horizontalTravel = uTime * (0.045 + aDepth * 0.085) * aSpeed;
+              float verticalTravel = uTime * (0.075 + aDepth * 0.13) * aSpeed;
+              drifted.x = mod(drifted.x + 9.2 + horizontalTravel, horizontalSpan) - 9.2;
+              drifted.y = mod(drifted.y + 4.9 + verticalTravel, verticalSpan) - 4.9;
+              drifted.x += sin(uTime * 0.17 * aSpeed + aPhase) * (0.06 + aDepth * 0.16);
+              drifted.y += cos(uTime * 0.13 * aSpeed + aPhase) * (0.04 + aDepth * 0.10);
+
+              vec2 heartCenter = vec2(0.0, 1.30);
+              vec2 offset = drifted.xy - heartCenter;
+              float distanceToHeart = length(offset);
+              float nearInfluence = 1.0 - smoothstep(4.6, 13.2, distanceToHeart);
+              float influence = nearInfluence * uAttraction * (0.76 + aDepth * 0.24);
+              float orbitAngle = uHeartRotation * (0.27 + aSpeed * 0.075) + aPhase * 0.08;
+              float cosineOrbit = cos(orbitAngle);
+              float sineOrbit = sin(orbitAngle);
+              vec2 orbitOffset = mat2(cosineOrbit, -sineOrbit, sineOrbit, cosineOrbit) * offset;
+              float pulledRadius = mix(1.0, 0.58, influence);
+              vec2 orbitPosition = heartCenter + orbitOffset * pulledRadius;
+              drifted.xy = mix(drifted.xy, orbitPosition, min(1.0, influence * 1.08));
+
+              vec4 viewPosition = modelViewMatrix * vec4(drifted, 1.0);
+              gl_Position = projectionMatrix * viewPosition;
+              gl_PointSize = aSize * uPixelRatio;
+              vColor = aColor;
+              float flicker = sin(uTime * 0.52 * aSpeed + aPhase) * 0.5 + 0.5;
+              vAlpha = mix(0.23, 0.11, aDepth) + flicker * mix(0.26, 0.145, aDepth);
+              vAlpha *= 1.0 + influence * 0.72;
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+              float distanceToCenter = length(gl_PointCoord - 0.5);
+              float core = 1.0 - smoothstep(0.0, 0.16, distanceToCenter);
+              float halo = 1.0 - smoothstep(0.08, 0.50, distanceToCenter);
+              float alpha = (core * 0.64 + halo * 0.94) * vAlpha;
+              if (alpha < 0.008) discard;
+              gl_FragColor = vec4(vColor, alpha);
+            }
+          `
+        });
+
+        backgroundGlows = new THREE.Points(glowGeometry, backgroundGlowMaterial);
+        backgroundGlows.renderOrder = -4;
+        backgroundGlows.frustumCulled = false;
+        scene.add(backgroundGlows);
+      }
+
+      function chooseHeartColor() {
+        const value = random();
+        if (value < 0.08) return [1.0, 0.93, 1.0];
+        if (value < 0.27) return [0.72, 0.18, 0.82];
+        if (value < 0.52) return [0.95, 0.20, 0.72];
+        if (value < 0.78) return [1.0, 0.30, 0.82];
+        return [0.84, 0.26, 0.96];
+      }
+
+      function chooseGroundColor() {
+        const value = random();
+        if (value < 0.56) return [0.72, 0.75, 0.82];
+        if (value < 0.82) return [0.86, 0.82, 0.98];
+        return [0.58, 0.48, 0.76];
+      }
+
+      function formationDelay(target, start) {
+        const height = THREE.MathUtils.clamp((target.ny + 1.0) / 2.25, 0, 1);
+        const side = THREE.MathUtils.clamp(Math.abs(target.nx) / 1.08, 0, 1);
+        const bottomAndSidesFirst = height * 0.58 + (1 - side) * 0.42;
+        const groundCenterOrder = Math.abs(start.x) / HALF_WIDTH * 0.68;
+
+        if (target.kind === 0) {
+          return 0.12 + random() * 1.05 + groundCenterOrder;
+        }
+        if (target.kind === 1) {
+          return 1.35 + bottomAndSidesFirst * 1.30 + random() * 0.58 + groundCenterOrder;
+        }
+        return 2.15 + bottomAndSidesFirst * 1.68 + random() * 0.72 + groundCenterOrder;
+      }
+
+      function createParticles() {
+        const positions = new Float32Array(PARTICLE_COUNT * 3);
+        const starts = new Float32Array(PARTICLE_COUNT * 3);
+        const targets = new Float32Array(PARTICLE_COUNT * 3);
+        const groundColors = new Float32Array(PARTICLE_COUNT * 3);
+        const heartColors = new Float32Array(PARTICLE_COUNT * 3);
+        const delays = new Float32Array(PARTICLE_COUNT);
+        const angles = new Float32Array(PARTICLE_COUNT);
+        const speeds = new Float32Array(PARTICLE_COUNT);
+        const sizes = new Float32Array(PARTICLE_COUNT);
+        const paths = new Float32Array(PARTICLE_COUNT * 3);
+        const movers = new Float32Array(PARTICLE_COUNT);
+
+        for (let i = 0; i < PARTICLE_COUNT; i++) {
+          const offset = i * 3;
+          const start = makeGroundPoint();
+          const isMover = i < HEART_PARTICLES;
+          const target = isMover ? makeTarget(i) : start;
+          const groundColor = chooseGroundColor();
+          const heartColor = isMover ? chooseHeartColor() : groundColor;
+
+          positions[offset] = start.x;
+          positions[offset + 1] = start.y;
+          positions[offset + 2] = start.z;
+          starts[offset] = start.x;
+          starts[offset + 1] = start.y;
+          starts[offset + 2] = start.z;
+          targets[offset] = target.x;
+          targets[offset + 1] = target.y;
+          targets[offset + 2] = target.z;
+          groundColors.set(groundColor, offset);
+          heartColors.set(heartColor, offset);
+          delays[i] = isMover ? formationDelay(target, start) : 9999;
+          angles[i] = random() * TAU;
+          speeds[i] = lerp(0.88, 1.16, random());
+          sizes[i] = random() < 0.055 ? lerp(4.2, 5.0, random()) : lerp(2.0, 3.85, random());
+          paths[offset] = lerp(0.72, 1.22, random());
+          paths[offset + 1] = random() < 0.5 ? -1 : 1;
+          paths[offset + 2] = lerp(-1, 1, random());
+          movers[i] = isMover ? 1 : 0;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute("aStart", new THREE.BufferAttribute(starts, 3));
+        geometry.setAttribute("aTarget", new THREE.BufferAttribute(targets, 3));
+        geometry.setAttribute("aGroundColor", new THREE.BufferAttribute(groundColors, 3));
+        geometry.setAttribute("aHeartColor", new THREE.BufferAttribute(heartColors, 3));
+        geometry.setAttribute("aDelay", new THREE.BufferAttribute(delays, 1));
+        geometry.setAttribute("aAngle", new THREE.BufferAttribute(angles, 1));
+        geometry.setAttribute("aSpeed", new THREE.BufferAttribute(speeds, 1));
+        geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute("aPath", new THREE.BufferAttribute(paths, 3));
+        geometry.setAttribute("aMover", new THREE.BufferAttribute(movers, 1));
+
+        material = new THREE.ShaderMaterial({
+          transparent: true,
+          depthTest: true,
+          depthWrite: false,
+          blending: THREE.NormalBlending,
+          toneMapped: true,
+          uniforms: {
+            uTime: { value: 0 },
+            uPixelRatio: { value: renderer.getPixelRatio() },
+            uHeartRotation: { value: 0 },
+            uHeartTilt: { value: 0 }
+          },
+          vertexShader: `
+            precision highp float;
+
+            attribute vec3 aStart;
+            attribute vec3 aTarget;
+            attribute vec3 aGroundColor;
+            attribute vec3 aHeartColor;
+            attribute float aDelay;
+            attribute float aAngle;
+            attribute float aSpeed;
+            attribute float aSize;
+            attribute vec3 aPath;
+            attribute float aMover;
+
+            uniform float uTime;
+            uniform float uPixelRatio;
+            uniform float uHeartRotation;
+            uniform float uHeartTilt;
+
+            varying vec3 vColor;
+            varying float vAlpha;
+            varying float vGlow;
+
+            const float TAU = 6.28318530718;
+
+            float ease(float value) {
+              value = clamp(value, 0.0, 1.0);
+              return value * value * (3.0 - 2.0 * value);
+            }
+
+            vec3 bezier(vec3 p0, vec3 p1, vec3 p2, vec3 p3, float t) {
+              float oneMinusT = 1.0 - t;
+              return oneMinusT * oneMinusT * oneMinusT * p0
+                + 3.0 * oneMinusT * oneMinusT * t * p1
+                + 3.0 * oneMinusT * t * t * p2
+                + t * t * t * p3;
+            }
+
+            vec3 rotateHeart(vec3 point) {
+              vec3 centered = point - vec3(0.0, 1.30, 0.0);
+              float cosineY = cos(uHeartRotation);
+              float sineY = sin(uHeartRotation);
+              centered.xz = mat2(cosineY, -sineY, sineY, cosineY) * centered.xz;
+              float cosineX = cos(uHeartTilt);
+              float sineX = sin(uHeartTilt);
+              centered.yz = mat2(cosineX, -sineX, sineX, cosineX) * centered.yz;
+              return centered + vec3(0.0, 1.30, 0.0);
+            }
+
+            vec3 vortex(float progress) {
+              float vertical = ease(progress);
+              float pull = smoothstep(0.0, 0.30, progress);
+              float bottomRadius = mix(0.92, 0.27, smoothstep(0.0, 0.48, progress));
+              float topSpread = 0.38 * smoothstep(0.70, 1.0, progress);
+              float radius = (bottomRadius + topSpread) * aPath.x;
+              float theta = aAngle + progress * TAU * (5.0 + aSpeed * 2.15);
+              vec3 axisPoint = vec3(
+                cos(theta) * radius,
+                mix(aStart.y, -0.18, vertical),
+                sin(theta) * radius
+              );
+              return vec3(
+                mix(aStart.x, axisPoint.x, pull),
+                axisPoint.y,
+                mix(aStart.z, axisPoint.z, pull)
+              );
+            }
+
+            void main() {
+              float localTime = uTime - aDelay;
+              float riseDuration = 3.62 / aSpeed;
+              float arcDuration = 1.64 / aSpeed;
+              float arrivalTime = riseDuration + arcDuration;
+              float travel = aMover * smoothstep(0.0, arrivalTime, max(localTime, 0.0));
+              vec3 transformed = aStart;
+              vec3 rotatedTarget = rotateHeart(aTarget);
+
+              float groundDrift = sin(uTime * 0.72 + aAngle * 2.0);
+              transformed.x += groundDrift * 0.012;
+              transformed.y += sin(uTime * 0.54 + aAngle) * 0.009;
+
+              if (aMover > 0.5 && localTime >= 0.0 && localTime < riseDuration) {
+                transformed = vortex(localTime / riseDuration);
+              } else if (aMover > 0.5 && localTime >= riseDuration && localTime < arrivalTime) {
+                float arcProgress = ease((localTime - riseDuration) / arcDuration);
+                vec3 p0 = vortex(1.0);
+                float side = aPath.y;
+                vec3 p1 = p0 + vec3(
+                  side * (0.72 + abs(rotatedTarget.x) * 0.10),
+                  0.62 + max(rotatedTarget.y, 0.0) * 0.08,
+                  aPath.z * 0.34
+                );
+                vec3 p2 = vec3(
+                  rotatedTarget.x * 0.76 + side * 0.40,
+                  rotatedTarget.y + 0.46,
+                  rotatedTarget.z * 0.50 + aPath.z * 0.16
+                );
+                transformed = bezier(p0, p1, p2, rotatedTarget, arcProgress);
+              } else if (aMover > 0.5 && localTime >= arrivalTime) {
+                transformed = rotatedTarget;
+              }
+
+              float finalState = aMover * step(arrivalTime, localTime);
+              float depthLight = mix(0.72, 1.13, clamp((rotatedTarget.z + 1.35) / 2.70, 0.0, 1.0));
+              vColor = mix(aGroundColor, aHeartColor * depthLight, travel);
+              vAlpha = mix(0.66, 0.96, travel);
+              vGlow = mix(0.12, 0.22, travel);
+
+              float groundDepth = smoothstep(-4.85, -2.55, aStart.y);
+              float groundScale = mix(1.08, 0.68, groundDepth);
+              float sizeScale = mix(groundScale, 1.0, travel);
+              float twinkle = 1.0 + sin(uTime * 2.15 + aAngle * 3.0) * (0.035 + finalState * 0.035);
+
+              vec4 viewPosition = modelViewMatrix * vec4(transformed, 1.0);
+              gl_Position = projectionMatrix * viewPosition;
+              gl_PointSize = aSize * uPixelRatio * sizeScale * twinkle;
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+
+            varying vec3 vColor;
+            varying float vAlpha;
+            varying float vGlow;
+
+            void main() {
+              float distanceToCenter = length(gl_PointCoord - 0.5);
+              float crispCore = 1.0 - smoothstep(0.16, 0.32, distanceToCenter);
+              float softEdge = 1.0 - smoothstep(0.31, 0.50, distanceToCenter);
+              float alpha = (crispCore * 0.82 + softEdge * vGlow) * vAlpha;
+              if (alpha < 0.025) discard;
+              vec3 color = vColor * (0.88 + crispCore * 0.16);
+              gl_FragColor = vec4(color, alpha);
+            }
+          `
+        });
+
+        particles = new THREE.Points(geometry, material);
+        particles.frustumCulled = false;
+        scene.add(particles);
+      }
+
+      function resize() {
+        const width = Math.max(1, Math.round(canvas.clientWidth));
+        const height = Math.max(1, Math.round(canvas.clientHeight));
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        renderer.setSize(width, height, false);
+        camera.aspect = width / height;
+        camera.updateProjectionMatrix();
+        material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+        backgroundMaterial.uniforms.uAspect.value = width / height;
+        backgroundStarMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+        backgroundGlowMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+      }
+
+      function render(now) {
+        const elapsed = Math.max(0, (now - startTime) * 0.001);
+        const rotationProgress = THREE.MathUtils.smoothstep(
+          elapsed,
+          HEART_ROTATION_START,
+          HEART_ROTATION_END
+        );
+        if (!pointerRotation.dragging) {
+          pointerRotation.y += pointerRotation.velocityY;
+          pointerRotation.x += pointerRotation.velocityX;
+          pointerRotation.velocityY *= 0.94;
+          pointerRotation.velocityX *= 0.92;
+        }
+        pointerRotation.x = THREE.MathUtils.clamp(pointerRotation.x, -1.05, 1.05);
+        const heartRotation = rotationProgress * TAU * HEART_AUTO_TURNS
+          + pointerRotation.y;
+        const autoAttraction = THREE.MathUtils.smoothstep(elapsed, 3.8, 5.0)
+          * (1 - THREE.MathUtils.smoothstep(elapsed, 13.0, 14.4));
+        const pointerSpeed = Math.min(
+          1,
+          (Math.abs(pointerRotation.velocityX) + Math.abs(pointerRotation.velocityY)) * 15
+        );
+        const targetAttraction = Math.max(autoAttraction, pointerSpeed);
+        photonAttraction += (targetAttraction - photonAttraction) * 0.11;
+        material.uniforms.uTime.value = elapsed;
+        material.uniforms.uHeartRotation.value = heartRotation;
+        material.uniforms.uHeartTilt.value = pointerRotation.x;
+        backgroundMaterial.uniforms.uTime.value = elapsed;
+        backgroundStarMaterial.uniforms.uTime.value = elapsed;
+        backgroundGlowMaterial.uniforms.uTime.value = elapsed;
+        backgroundGlowMaterial.uniforms.uHeartRotation.value = heartRotation;
+        backgroundGlowMaterial.uniforms.uAttraction.value = photonAttraction;
+        renderer.render(scene, camera);
+        animationFrame = requestAnimationFrame(render);
+      }
+
+      function pointerDown(event) {
+        pointerRotation.dragging = true;
+        pointerRotation.pointerId = event.pointerId;
+        pointerRotation.lastX = event.clientX;
+        pointerRotation.lastY = event.clientY;
+        pointerRotation.velocityX = 0;
+        pointerRotation.velocityY = 0;
+        canvas.setPointerCapture(event.pointerId);
+      }
+
+      function pointerMove(event) {
+        if (!pointerRotation.dragging || event.pointerId !== pointerRotation.pointerId) return;
+        const deltaX = event.clientX - pointerRotation.lastX;
+        const deltaY = event.clientY - pointerRotation.lastY;
+        pointerRotation.velocityY = deltaX * 0.006;
+        pointerRotation.velocityX = deltaY * 0.0045;
+        pointerRotation.y += pointerRotation.velocityY;
+        pointerRotation.x += pointerRotation.velocityX;
+        pointerRotation.lastX = event.clientX;
+        pointerRotation.lastY = event.clientY;
+      }
+
+      function pointerUp(event) {
+        if (event.pointerId !== pointerRotation.pointerId) return;
+        pointerRotation.dragging = false;
+        pointerRotation.pointerId = -1;
+        if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
+      }
+
+      function restart() {
+        startTime = performance.now();
+        photonAttraction = 0;
+      }
+
+      function init() {
+        if (!window.THREE) throw new Error("Three.js 加载失败");
+
+        renderer = new THREE.WebGLRenderer({
+          canvas,
+          antialias: true,
+          alpha: false,
+          powerPreference: "high-performance"
+        });
+        renderer.setClearColor(0x000000, 1);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 0.90;
+
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(48, 16 / 9, 0.1, 40);
+        camera.position.set(0, 0, 11.23);
+        camera.lookAt(0, 0, 0);
+
+        createRomanticBackground();
+        createParticles();
+        resize();
+        window.addEventListener("resize", resize, { passive: true });
+        canvas.addEventListener("pointerdown", pointerDown);
+        canvas.addEventListener("pointermove", pointerMove);
+        canvas.addEventListener("pointerup", pointerUp);
+        canvas.addEventListener("pointercancel", pointerUp);
+        window.restartParticleHeart = restart;
+        startTime = performance.now();
+        animationFrame = requestAnimationFrame(render);
+      }
+
+      try {
+        init();
+      } catch (error) {
+        console.error(error);
+        errorMessage.textContent = error.message || "场景初始化失败";
+        errorMessage.style.display = "block";
+      }
+
+      window.addEventListener("beforeunload", () => {
+        cancelAnimationFrame(animationFrame);
+        particles?.geometry.dispose();
+        material?.dispose();
+        backgroundPlane?.geometry.dispose();
+        backgroundMaterial?.dispose();
+        backgroundStars?.geometry.dispose();
+        backgroundStarMaterial?.dispose();
+        backgroundGlows?.geometry.dispose();
+        backgroundGlowMaterial?.dispose();
+        renderer?.dispose();
+        canvas.removeEventListener("pointerdown", pointerDown);
+        canvas.removeEventListener("pointermove", pointerMove);
+        canvas.removeEventListener("pointerup", pointerUp);
+        canvas.removeEventListener("pointercancel", pointerUp);
+      });
+    })();
+  </script>
+</body>
+</html>

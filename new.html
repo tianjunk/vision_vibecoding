@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gesture Particle Orb</title>
+  <link rel="icon" href="data:,">
+  <script defer src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+
+    * { box-sizing: border-box; }
+
+    html, body, main {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #020304;
+    }
+
+    #scene {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+
+    #camera { display: none; }
+
+    #status {
+      position: fixed;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      padding: 6px 9px;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 4px;
+      color: rgba(255, 255, 255, 0.76);
+      background: rgba(2, 3, 4, 0.72);
+      font: 12px/1.2 system-ui, sans-serif;
+      letter-spacing: 0;
+      pointer-events: none;
+      transition: opacity 260ms ease;
+    }
+
+    #status:empty {
+      opacity: 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <canvas id="scene"></canvas>
+    <video id="camera" autoplay muted playsinline></video>
+    <div id="status">Starting camera...</div>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const canvas = document.getElementById("scene");
+      const video = document.getElementById("camera");
+      const status = document.getElementById("status");
+      const TAU = Math.PI * 2;
+
+      const gesture = {
+        visible: false,
+        x: 0,
+        y: 0,
+        targetX: 0,
+        targetY: 0,
+        scale: 1,
+        targetScale: 1,
+        spread: 0,
+        targetSpread: 0,
+        compression: 0,
+        targetCompression: 0,
+        spin: 0.24,
+        targetSpin: 0.24,
+        lastX: 0.5,
+        lastY: 0.5,
+        overrideUntil: 0
+      };
+
+      let renderer;
+      let scene;
+      let camera;
+      let orb;
+      let orbMaterial;
+      let core;
+      let coreMaterial;
+      let stars;
+      let dust;
+      let handTracker;
+      let mediaCamera;
+      let lastFrame = performance.now();
+
+      function clamp(value, min, max) {
+        return Math.max(min, Math.min(max, value));
+      }
+
+      function smoothstep(min, max, value) {
+        const t = clamp((value - min) / (max - min), 0, 1);
+        return t * t * (3 - 2 * t);
+      }
+
+      function distance(a, b) {
+        return Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+      }
+
+      function initScene() {
+        if (!window.THREE) {
+          throw new Error("Three.js failed to load");
+        }
+
+        renderer = new THREE.WebGLRenderer({
+          canvas,
+          antialias: true,
+          alpha: false,
+          powerPreference: "high-performance"
+        });
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight, false);
+        renderer.setClearColor(0x020304, 1);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+        scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x020304, 0.00046);
+
+        camera = new THREE.PerspectiveCamera(
+          48,
+          window.innerWidth / window.innerHeight,
+          1,
+          5000
+        );
+        camera.position.set(0, 0, 920);
+
+        createStars();
+        createDust();
+        createOrb();
+        window.addEventListener("resize", resize);
+      }
+
+      function createStars() {
+        const count = 9000;
+        const positions = new Float32Array(count * 3);
+        const sizes = new Float32Array(count);
+        const colors = new Float32Array(count * 3);
+
+        for (let i = 0; i < count; i++) {
+          const index = i * 3;
+          const radius = 950 + Math.random() * 2700;
+          const theta = Math.random() * TAU;
+          const phi = Math.acos(2 * Math.random() - 1);
+          positions[index] = radius * Math.sin(phi) * Math.cos(theta);
+          positions[index + 1] = radius * Math.sin(phi) * Math.sin(theta);
+          positions[index + 2] = radius * Math.cos(phi) - 700;
+          sizes[i] = 0.7 + Math.random() * 2.6;
+
+          const colorType = Math.random();
+          if (colorType < 0.16) {
+            colors[index] = 1.0;
+            colors[index + 1] = 0.73;
+            colors[index + 2] = 0.48;
+          } else if (colorType < 0.34) {
+            colors[index] = 0.54;
+            colors[index + 1] = 0.82;
+            colors[index + 2] = 1.0;
+          } else {
+            colors[index] = 0.88;
+            colors[index + 1] = 0.92;
+            colors[index + 2] = 1.0;
+          }
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
+
+        const material = new THREE.ShaderMaterial({
+          transparent: true,
+          depthWrite: false,
+          vertexColors: true,
+          uniforms: { uPixelRatio: { value: renderer.getPixelRatio() } },
+          vertexShader: `
+            attribute float aSize;
+            attribute vec3 aColor;
+            uniform float uPixelRatio;
+            varying vec3 vColor;
+
+            void main() {
+              vColor = aColor;
+              vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
+              gl_PointSize = aSize * uPixelRatio * (680.0 / max(220.0, -viewPosition.z));
+              gl_Position = projectionMatrix * viewPosition;
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+            varying vec3 vColor;
+
+            void main() {
+              float distanceToCenter = length(gl_PointCoord - 0.5);
+              float alpha = 1.0 - smoothstep(0.12, 0.50, distanceToCenter);
+              if (alpha < 0.02) discard;
+              gl_FragColor = vec4(vColor, alpha * 0.82);
+            }
+          `
+        });
+
+        stars = new THREE.Points(geometry, material);
+        scene.add(stars);
+      }
+
+      function createDust() {
+        const count = 1800;
+        const positions = new Float32Array(count * 3);
+        const colors = new Float32Array(count * 3);
+
+        for (let i = 0; i < count; i++) {
+          const index = i * 3;
+          const angle = Math.random() * TAU;
+          const radius = 280 + Math.pow(Math.random(), 0.65) * 1100;
+          positions[index] = Math.cos(angle) * radius;
+          positions[index + 1] = (Math.random() - 0.5) * 480;
+          positions[index + 2] = Math.sin(angle) * radius - 320;
+
+          const warm = Math.random() > 0.70;
+          colors[index] = warm ? 1.0 : 0.24;
+          colors[index + 1] = warm ? 0.42 : 0.70;
+          colors[index + 2] = warm ? 0.20 : 1.0;
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+        const material = new THREE.PointsMaterial({
+          size: 1.35,
+          transparent: true,
+          opacity: 0.30,
+          vertexColors: true,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending
+        });
+        dust = new THREE.Points(geometry, material);
+        dust.rotation.x = -0.18;
+        scene.add(dust);
+      }
+
+      function createOrb() {
+        const count = 30000;
+        const positions = new Float32Array(count * 3);
+        const directions = new Float32Array(count * 3);
+        const seeds = new Float32Array(count);
+        const sizes = new Float32Array(count);
+        const colors = new Float32Array(count * 3);
+
+        for (let i = 0; i < count; i++) {
+          const index = i * 3;
+          const theta = Math.random() * TAU;
+          const z = Math.random() * 2 - 1;
+          const ring = Math.sqrt(Math.max(0, 1 - z * z));
+          const dx = Math.cos(theta) * ring;
+          const dy = Math.sin(theta) * ring;
+          const dz = z;
+          const shellBias = Math.random() < 0.60;
+          const radius = shellBias
+            ? 178 + (Math.random() - 0.5) * 17
+            : Math.cbrt(Math.random()) * 170;
+
+          positions[index] = dx * radius;
+          positions[index + 1] = dy * radius;
+          positions[index + 2] = dz * radius;
+          directions[index] = dx;
+          directions[index + 1] = dy;
+          directions[index + 2] = dz;
+          seeds[i] = Math.random();
+          sizes[i] = 1.15 + Math.random() * 3.4;
+
+          const colorType = Math.random();
+          if (colorType < 0.16) {
+            colors[index] = 1.0;
+            colors[index + 1] = 0.34;
+            colors[index + 2] = 0.18;
+          } else if (colorType < 0.34) {
+            colors[index] = 0.96;
+            colors[index + 1] = 0.78;
+            colors[index + 2] = 0.28;
+          } else if (colorType < 0.78) {
+            colors[index] = 0.18;
+            colors[index + 1] = 0.86;
+            colors[index + 2] = 1.0;
+          } else {
+            colors[index] = 0.92;
+            colors[index + 1] = 0.96;
+            colors[index + 2] = 1.0;
+          }
+        }
+
+        const geometry = new THREE.BufferGeometry();
+        geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute("aDirection", new THREE.BufferAttribute(directions, 3));
+        geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+        geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute("aColor", new THREE.BufferAttribute(colors, 3));
+
+        orbMaterial = new THREE.ShaderMaterial({
+          transparent: true,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          uniforms: {
+            uTime: { value: 0 },
+            uPixelRatio: { value: renderer.getPixelRatio() },
+            uSpread: { value: 0 },
+            uCompression: { value: 0 },
+            uEnergy: { value: 0.42 }
+          },
+          vertexShader: `
+            attribute vec3 aDirection;
+            attribute float aSeed;
+            attribute float aSize;
+            attribute vec3 aColor;
+            uniform float uTime;
+            uniform float uPixelRatio;
+            uniform float uSpread;
+            uniform float uCompression;
+            uniform float uEnergy;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+              float phase = aSeed * 31.4159;
+              float wave = sin(uTime * (1.0 + aSeed * 1.8) + phase);
+              float crossWave = cos(uTime * 0.72 + position.y * 0.028 + phase);
+              vec3 tangent = normalize(cross(aDirection, vec3(0.13, 1.0, 0.21)) + vec3(0.0001));
+              vec3 displaced = position;
+              displaced *= mix(1.0, 0.54, uCompression);
+              displaced += aDirection * wave * (3.0 + uEnergy * 10.0);
+              displaced += tangent * crossWave * (2.0 + uEnergy * 7.0);
+              displaced += aDirection * uSpread * (65.0 + aSeed * 240.0);
+              displaced += tangent * uSpread * sin(phase + uTime * 3.0) * 42.0;
+
+              vec4 viewPosition = modelViewMatrix * vec4(displaced, 1.0);
+              float perspective = 720.0 / max(180.0, -viewPosition.z);
+              gl_PointSize = aSize * uPixelRatio * perspective * (1.0 + uEnergy * 0.32) * mix(1.0, 0.42, uCompression);
+              gl_Position = projectionMatrix * viewPosition;
+              vec3 compressedColor = vec3(1.0, 0.16 + aSeed * 0.22, 0.035);
+              vColor = mix(aColor, compressedColor, uCompression * 0.78) * (0.78 + uEnergy * 0.55 + wave * 0.10);
+              vAlpha = (0.58 + aSeed * 0.38) * mix(1.0, 0.08, uCompression);
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+              vec2 point = gl_PointCoord - 0.5;
+              float distanceToCenter = length(point);
+              float body = 1.0 - smoothstep(0.22, 0.50, distanceToCenter);
+              float core = 1.0 - smoothstep(0.02, 0.16, distanceToCenter);
+              float alpha = body * vAlpha;
+              if (alpha < 0.025) discard;
+              gl_FragColor = vec4(vColor * (0.86 + core * 0.72), alpha);
+            }
+          `
+        });
+
+        orb = new THREE.Points(geometry, orbMaterial);
+        scene.add(orb);
+
+        coreMaterial = new THREE.ShaderMaterial({
+          transparent: true,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+          side: THREE.BackSide,
+          uniforms: {
+            uTime: { value: 0 },
+            uEnergy: { value: 0.4 },
+            uCompression: { value: 0 }
+          },
+          vertexShader: `
+            varying vec3 vNormal;
+            varying vec3 vView;
+
+            void main() {
+              vNormal = normalize(normalMatrix * normal);
+              vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
+              vView = normalize(-viewPosition.xyz);
+              gl_Position = projectionMatrix * viewPosition;
+            }
+          `,
+          fragmentShader: `
+            precision highp float;
+            uniform float uTime;
+            uniform float uEnergy;
+            uniform float uCompression;
+            varying vec3 vNormal;
+            varying vec3 vView;
+
+            void main() {
+              float fresnel = pow(1.0 - abs(dot(vNormal, vView)), 2.8);
+              float pulse = 0.78 + sin(uTime * 2.1) * 0.08;
+              vec3 cold = vec3(0.05, 0.54, 0.74);
+              vec3 warm = vec3(0.94, 0.29, 0.08);
+              vec3 color = mix(cold, warm, uCompression * 0.82);
+              float alpha = fresnel * (0.08 + uEnergy * 0.13) * pulse;
+              gl_FragColor = vec4(color, alpha);
+            }
+          `
+        });
+        core = new THREE.Mesh(new THREE.SphereGeometry(166, 48, 32), coreMaterial);
+        scene.add(core);
+      }
+
+      function processHand(results) {
+        if (performance.now() < gesture.overrideUntil) {
+          return;
+        }
+
+        const landmarks = results.multiHandLandmarks?.[0];
+        if (!landmarks) {
+          gesture.visible = false;
+          gesture.targetX = 0;
+          gesture.targetY = 0;
+          gesture.targetScale = 1;
+          gesture.targetSpread = 0;
+          gesture.targetCompression = 0;
+          gesture.targetSpin = 0.24;
+          return;
+        }
+
+        const palm = [landmarks[0], landmarks[5], landmarks[9], landmarks[13], landmarks[17]]
+          .reduce((sum, point) => ({
+            x: sum.x + point.x / 5,
+            y: sum.y + point.y / 5
+          }), { x: 0, y: 0 });
+
+        const palmWidth = Math.max(0.025, distance(landmarks[5], landmarks[17]));
+        const pinchRatio = distance(landmarks[4], landmarks[8]) / palmWidth;
+        const openness = [8, 12, 16, 20]
+          .reduce((sum, index) => sum + distance(landmarks[index], landmarks[0]), 0) /
+          (4 * palmWidth);
+        const pinch = 1 - smoothstep(0.24, 0.86, pinchRatio);
+        const open = smoothstep(1.72, 2.52, openness);
+        const fist = 1 - smoothstep(1.05, 1.62, openness);
+        const motion = Math.hypot(palm.x - gesture.lastX, palm.y - gesture.lastY);
+
+        gesture.visible = true;
+        gesture.targetX = (0.5 - palm.x) * 760;
+        gesture.targetY = (0.5 - palm.y) * 430;
+        gesture.targetScale = 1.02 - pinch * 0.34 + open * 0.10 - fist * 0.28;
+        gesture.targetSpread = open * (0.52 + clamp(motion * 15, 0, 0.70));
+        gesture.targetCompression = Math.max(fist, pinch * 0.72);
+        gesture.targetSpin = 0.24 + clamp(motion * 18, 0, 2.4);
+        gesture.lastX = palm.x;
+        gesture.lastY = palm.y;
+      }
+
+      function updateGesture(dt) {
+        const positionEase = 1 - Math.exp(-dt * 7.5);
+        const stateEase = 1 - Math.exp(-dt * 9.0);
+        gesture.x += (gesture.targetX - gesture.x) * positionEase;
+        gesture.y += (gesture.targetY - gesture.y) * positionEase;
+        gesture.scale += (gesture.targetScale - gesture.scale) * stateEase;
+        gesture.spread += (gesture.targetSpread - gesture.spread) * stateEase;
+        gesture.compression += (gesture.targetCompression - gesture.compression) * stateEase;
+        gesture.spin += (gesture.targetSpin - gesture.spin) * stateEase;
+      }
+
+      function animate(now) {
+        requestAnimationFrame(animate);
+        const dt = Math.min(0.033, (now - lastFrame) / 1000 || 0.016);
+        lastFrame = now;
+        updateGesture(dt);
+
+        const time = now * 0.001;
+        orb.position.x = gesture.x;
+        orb.position.y = gesture.y + Math.sin(time * 0.85) * 9;
+        orb.rotation.y += dt * gesture.spin;
+        orb.rotation.x = Math.sin(time * 0.31) * 0.18;
+        orb.scale.setScalar(gesture.scale);
+
+        core.position.copy(orb.position);
+        core.rotation.copy(orb.rotation);
+        core.scale.setScalar(gesture.scale * (1 - gesture.compression * 0.16));
+
+        const energy = 0.40 + gesture.spread * 0.65 + gesture.compression * 0.38;
+        orbMaterial.uniforms.uTime.value = time;
+        orbMaterial.uniforms.uSpread.value = gesture.spread;
+        orbMaterial.uniforms.uCompression.value = gesture.compression;
+        orbMaterial.uniforms.uEnergy.value = energy;
+        coreMaterial.uniforms.uTime.value = time;
+        coreMaterial.uniforms.uEnergy.value = energy;
+        coreMaterial.uniforms.uCompression.value = gesture.compression;
+
+        stars.rotation.y += dt * 0.0035;
+        stars.rotation.x = Math.sin(time * 0.04) * 0.025;
+        dust.rotation.y -= dt * 0.018;
+        dust.rotation.z = Math.sin(time * 0.08) * 0.08;
+        camera.position.x += ((gesture.x * 0.035) - camera.position.x) * (1 - Math.exp(-dt * 1.6));
+        camera.position.y += ((gesture.y * 0.025) - camera.position.y) * (1 - Math.exp(-dt * 1.6));
+        camera.lookAt(0, 0, 0);
+        renderer.render(scene, camera);
+      }
+
+      function resize() {
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+        renderer.setSize(window.innerWidth, window.innerHeight, false);
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        stars.material.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+        orbMaterial.uniforms.uPixelRatio.value = renderer.getPixelRatio();
+      }
+
+      async function startTracking() {
+        if (!window.Hands || !window.Camera) {
+          throw new Error("MediaPipe Hands failed to load");
+        }
+
+        handTracker = new Hands({
+          locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        handTracker.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          selfieMode: true,
+          minDetectionConfidence: 0.58,
+          minTrackingConfidence: 0.52
+        });
+        handTracker.onResults(processHand);
+
+        mediaCamera = new Camera(video, {
+          width: 640,
+          height: 360,
+          onFrame: async () => handTracker.send({ image: video })
+        });
+        await mediaCamera.start();
+        status.textContent = "";
+      }
+
+      function stop() {
+        if (mediaCamera && typeof mediaCamera.stop === "function") mediaCamera.stop();
+        if (handTracker && typeof handTracker.close === "function") handTracker.close();
+        if (video.srcObject) video.srcObject.getTracks().forEach(track => track.stop());
+      }
+
+      window.__setGesture = values => {
+        gesture.overrideUntil = performance.now() + 1800;
+        gesture.visible = values.visible ?? true;
+        gesture.targetX = values.x ?? gesture.targetX;
+        gesture.targetY = values.y ?? gesture.targetY;
+        gesture.targetScale = values.scale ?? gesture.targetScale;
+        gesture.targetSpread = values.spread ?? gesture.targetSpread;
+        gesture.targetCompression = values.compression ?? gesture.targetCompression;
+        gesture.targetSpin = values.spin ?? gesture.targetSpin;
+        return { ...gesture };
+      };
+
+      window.addEventListener("load", async () => {
+        try {
+          initScene();
+          requestAnimationFrame(animate);
+          await startTracking();
+        } catch (error) {
+          console.error(error);
+          status.textContent = "Camera unavailable - automatic mode active";
+          setTimeout(() => { status.textContent = ""; }, 2400);
+        }
+      }, { once: true });
+      window.addEventListener("beforeunload", stop);
+    })();
+  </script>
+</body>
+</html>

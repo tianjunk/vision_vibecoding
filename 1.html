@@ -1,0 +1,1440 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gesture Football</title>
+  <link rel="icon" href="data:,">
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"
+      }
+    }
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body, #app {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #07100b;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      touch-action: none;
+    }
+
+    #handOverlay {
+      position: fixed;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+    }
+
+    video { display: none; }
+
+    #hud {
+      position: fixed;
+      inset: 0;
+      z-index: 2;
+      pointer-events: none;
+      color: #f4f7f5;
+      text-shadow: 0 1px 2px rgba(0, 0, 0, 0.72);
+    }
+
+    .metric {
+      position: absolute;
+      top: 18px;
+      min-width: 104px;
+      padding: 9px 12px 8px;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 4px;
+      background: rgba(7, 13, 9, 0.72);
+      backdrop-filter: blur(10px);
+    }
+
+    .metric small {
+      display: block;
+      margin-bottom: 2px;
+      color: rgba(255, 255, 255, 0.58);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .metric strong {
+      display: block;
+      font-size: 25px;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #scoreBox { left: 18px; }
+    #timeBox { left: 50%; transform: translateX(-50%); text-align: center; }
+    #comboBox { right: 18px; text-align: right; }
+
+    #cameraState {
+      position: absolute;
+      left: 18px;
+      bottom: 17px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 8px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 4px;
+      background: rgba(7, 13, 9, 0.68);
+      color: rgba(255, 255, 255, 0.62);
+      font-size: 11px;
+      font-weight: 700;
+    }
+
+    #cameraDot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #e1a83b;
+      box-shadow: 0 0 8px currentColor;
+    }
+
+    #cameraState.active #cameraDot { background: #55d88b; }
+
+    #feedback {
+      position: absolute;
+      left: 50%;
+      top: 23%;
+      transform: translate(-50%, -50%) scale(0.92);
+      color: #fff;
+      font-size: clamp(30px, 5vw, 64px);
+      font-weight: 900;
+      line-height: 0.95;
+      text-align: center;
+      opacity: 0;
+      transition: opacity 130ms ease, transform 180ms ease;
+    }
+
+    #feedback.show {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
+    }
+
+    #feedback span {
+      display: block;
+      margin-top: 8px;
+      color: #f5c84c;
+      font-size: 14px;
+      font-weight: 800;
+    }
+
+    #power {
+      position: absolute;
+      left: 50%;
+      bottom: 18px;
+      width: min(320px, 54vw);
+      height: 5px;
+      transform: translateX(-50%);
+      overflow: hidden;
+      border-radius: 2px;
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    #powerFill {
+      width: 0%;
+      height: 100%;
+      background: #65df9b;
+      transition: width 80ms linear, background-color 120ms ease;
+    }
+
+    @media (max-width: 640px) {
+      .metric { top: 10px; min-width: 82px; padding: 7px 9px; }
+      .metric strong { font-size: 20px; }
+      #scoreBox { left: 10px; }
+      #comboBox { right: 10px; }
+      #cameraState { left: 10px; bottom: 10px; }
+      #power { bottom: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <main id="app">
+    <video id="camera" autoplay muted playsinline></video>
+    <canvas id="handOverlay" aria-hidden="true"></canvas>
+    <div id="hud">
+      <div class="metric" id="scoreBox"><small>SCORE</small><strong id="score">0</strong></div>
+      <div class="metric" id="timeBox"><small>TIME</small><strong id="time">60</strong></div>
+      <div class="metric" id="comboBox"><small>COMBO</small><strong id="combo">x1</strong></div>
+      <div id="feedback"></div>
+      <div id="cameraState"><i id="cameraDot"></i><span id="cameraLabel">MOUSE</span></div>
+      <div id="power"><div id="powerFill"></div></div>
+    </div>
+  </main>
+
+  <script type="module">
+    import * as THREE from "three";
+    import * as CANNON from "cannon-es";
+
+    const app = document.getElementById("app");
+    const video = document.getElementById("camera");
+    const handOverlay = document.getElementById("handOverlay");
+    const handCtx = handOverlay.getContext("2d");
+    const scoreNode = document.getElementById("score");
+    const timeNode = document.getElementById("time");
+    const comboNode = document.getElementById("combo");
+    const feedbackNode = document.getElementById("feedback");
+    const cameraState = document.getElementById("cameraState");
+    const cameraLabel = document.getElementById("cameraLabel");
+    const powerFill = document.getElementById("powerFill");
+
+    const GOAL_Z = -18;
+    const GOAL_WIDTH = 8;
+    const GOAL_HEIGHT = 4.4;
+    const TAU = Math.PI * 2;
+    const HAND_CONNECTIONS = [
+      [0, 1], [1, 2], [2, 3], [3, 4],
+      [0, 5], [5, 6], [6, 7], [7, 8],
+      [5, 9], [9, 10], [10, 11], [11, 12],
+      [9, 13], [13, 14], [14, 15], [15, 16],
+      [13, 17], [17, 18], [18, 19], [19, 20],
+      [0, 17]
+    ];
+    const BALL_START = new THREE.Vector3(0, 0.34, 6.2);
+    const ROUND_SECONDS = 60;
+    const FINGER_KICK_SPEED = 1.55;
+    const FINGER_KICK_DISTANCE = 0.17;
+    const FINGER_REARM_DISTANCE = 0.06;
+
+    const game = {
+      score: 0,
+      combo: 0,
+      shots: 0,
+      goals: 0,
+      startedAt: performance.now(),
+      remaining: ROUND_SECONDS,
+      finished: false,
+      shotActive: false,
+      shotAt: 0,
+      shotCurve: 0,
+      shotTargetX: 0,
+      lastBallZ: BALL_START.z,
+      saved: false,
+      resolved: false,
+      resetAt: 0,
+      nextRoundAt: 0,
+      feedbackTimer: 0
+    };
+
+    const input = {
+      aimX: 0,
+      aimY: 2.1,
+      targetX: 0,
+      targetY: 2.1,
+      targetSmoothX: 0,
+      targetSmoothY: 2.1,
+      handVisible: false,
+      handSpeed: 0,
+      wavePower: 0,
+      previousTime: 0,
+      missingFrames: 0,
+      gestureState: "FEET READY",
+      activeFoot: "",
+      footKick: null,
+      fingers: {
+        index: { previous: null, baseline: null, velocity: 0, progress: 0, armed: true },
+        middle: { previous: null, baseline: null, velocity: 0, progress: 0, armed: true }
+      },
+      cooldownUntil: 0
+    };
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x07100b);
+    scene.fog = new THREE.Fog(0x07100b, 25, 82);
+
+    const camera = new THREE.PerspectiveCamera(48, innerWidth / innerHeight, 0.1, 180);
+    camera.position.set(0, 5.4, 16.5);
+    camera.lookAt(0, 1.55, -11.5);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.08;
+    app.prepend(renderer.domElement);
+
+    const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0) });
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.allowSleep = true;
+
+    const ballMaterial = new CANNON.Material("ball");
+    const groundMaterial = new CANNON.Material("ground");
+    const postMaterial = new CANNON.Material("post");
+    world.addContactMaterial(new CANNON.ContactMaterial(ballMaterial, groundMaterial, {
+      friction: 0.38,
+      restitution: 0.44
+    }));
+    world.addContactMaterial(new CANNON.ContactMaterial(ballMaterial, postMaterial, {
+      friction: 0.16,
+      restitution: 0.70
+    }));
+
+    const clock = new THREE.Clock();
+    const tempVector = new THREE.Vector3();
+    let ballMesh;
+    let ballBody;
+    let leftFoot;
+    let rightFoot;
+    let keeperGroup;
+    let keeperBody;
+    let keeperTargetX = 0;
+    let keeperReactionAt = 0;
+    let reticle;
+    let reticleMaterial;
+    let guideLine;
+    let trail;
+    let trailPositions;
+    let trailHead = 0;
+    let trailCount = 0;
+    let targetRings = [];
+    let hands;
+    let mediaCamera;
+    let lastRender = performance.now();
+    let handOverlayHoldUntil = 0;
+
+    function clamp(value, min, max) {
+      return Math.max(min, Math.min(max, value));
+    }
+
+    function resizeHandOverlay() {
+      const ratio = Math.min(devicePixelRatio || 1, 2);
+      handOverlay.width = Math.round(innerWidth * ratio);
+      handOverlay.height = Math.round(innerHeight * ratio);
+      handCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    }
+
+    function clearHandOverlay() {
+      handCtx.clearRect(0, 0, innerWidth, innerHeight);
+    }
+
+    function fixedHandPoints(landmarks) {
+      const palmWidth = Math.max(0.025, Math.hypot(
+        landmarks[5].x - landmarks[17].x,
+        landmarks[5].y - landmarks[17].y
+      ));
+      const center = [0, 5, 9, 13, 17].reduce((sum, index) => ({
+        x: sum.x + landmarks[index].x / 5,
+        y: sum.y + landmarks[index].y / 5
+      }), { x: 0, y: 0 });
+      const direction = Math.atan2(landmarks[9].y - landmarks[0].y, landmarks[9].x - landmarks[0].x);
+      const rotation = -Math.PI / 2 - direction;
+      const cos = Math.cos(rotation);
+      const sin = Math.sin(rotation);
+      const scale = 62 / palmWidth;
+      const anchorX = 126;
+      const anchorY = innerHeight - 137;
+
+      return landmarks.map(landmark => {
+        const dx = landmark.x - center.x;
+        const dy = landmark.y - center.y;
+        return {
+          x: anchorX + (dx * cos - dy * sin) * scale,
+          y: anchorY + (dx * sin + dy * cos) * scale
+        };
+      });
+    }
+
+    function drawHandOverlay(landmarks, fingerState = input.fingers, state = "FEET READY") {
+      clearHandOverlay();
+      if (!landmarks?.length) return;
+
+      const points = fixedHandPoints(landmarks);
+      const panelX = 18;
+      const panelY = innerHeight - 258;
+      const panelWidth = 216;
+      const panelHeight = 204;
+      const indexPower = clamp(fingerState.index.progress, 0, 1);
+      const middlePower = clamp(fingerState.middle.progress, 0, 1);
+
+      handCtx.save();
+      handCtx.lineCap = "round";
+      handCtx.lineJoin = "round";
+      handCtx.fillStyle = "rgba(4,10,7,0.78)";
+      handCtx.strokeStyle = "rgba(255,255,255,0.17)";
+      handCtx.lineWidth = 1;
+      handCtx.fillRect(panelX, panelY, panelWidth, panelHeight);
+      handCtx.strokeRect(panelX + 0.5, panelY + 0.5, panelWidth - 1, panelHeight - 1);
+
+      handCtx.strokeStyle = "rgba(190,205,198,0.28)";
+      handCtx.lineWidth = 5.5;
+      for (const [from, to] of HAND_CONNECTIONS) {
+        handCtx.beginPath();
+        handCtx.moveTo(points[from].x, points[from].y);
+        handCtx.lineTo(points[to].x, points[to].y);
+        handCtx.stroke();
+      }
+
+      handCtx.strokeStyle = "rgba(205,218,212,0.68)";
+      handCtx.lineWidth = 1.7;
+      for (const [from, to] of HAND_CONNECTIONS) {
+        handCtx.beginPath();
+        handCtx.moveTo(points[from].x, points[from].y);
+        handCtx.lineTo(points[to].x, points[to].y);
+        handCtx.stroke();
+      }
+
+      const drawFinger = (chain, color, power) => {
+        handCtx.strokeStyle = color;
+        handCtx.lineWidth = 4 + power * 2;
+        for (let i = 0; i < chain.length - 1; i++) {
+          handCtx.beginPath();
+          handCtx.moveTo(points[chain[i]].x, points[chain[i]].y);
+          handCtx.lineTo(points[chain[i + 1]].x, points[chain[i + 1]].y);
+          handCtx.stroke();
+        }
+      };
+      drawFinger([5, 6, 7, 8], `rgba(78,211,255,${0.76 + indexPower * 0.24})`, indexPower);
+      drawFinger([9, 10, 11, 12], `rgba(255,174,61,${0.76 + middlePower * 0.24})`, middlePower);
+
+      points.forEach((point, index) => {
+        const indexFinger = [5, 6, 7, 8].includes(index);
+        const middleFinger = [9, 10, 11, 12].includes(index);
+        handCtx.beginPath();
+        handCtx.arc(point.x, point.y, index === 8 || index === 12 ? 6 : 3.2, 0, TAU);
+        handCtx.fillStyle = indexFinger
+          ? "rgba(78,211,255,0.98)"
+          : middleFinger
+            ? "rgba(255,174,61,0.98)"
+            : "rgba(215,225,220,0.82)";
+        handCtx.fill();
+      });
+
+      handCtx.font = "700 11px system-ui, sans-serif";
+      handCtx.fillStyle = "rgba(255,255,255,0.78)";
+      handCtx.fillText(state, panelX + 12, panelY + 18);
+      handCtx.fillStyle = "#4ed3ff";
+      handCtx.fillText("INDEX / LEFT FOOT", panelX + 12, panelY + panelHeight - 31);
+      handCtx.fillStyle = "#ffae3d";
+      handCtx.fillText("MIDDLE / RIGHT FOOT", panelX + 12, panelY + panelHeight - 12);
+      handCtx.fillStyle = "rgba(78,211,255,0.28)";
+      handCtx.fillRect(panelX + 120, panelY + panelHeight - 39, 82, 5);
+      handCtx.fillStyle = "#4ed3ff";
+      handCtx.fillRect(panelX + 120, panelY + panelHeight - 39, 82 * indexPower, 5);
+      handCtx.fillStyle = "rgba(255,174,61,0.28)";
+      handCtx.fillRect(panelX + 120, panelY + panelHeight - 20, 82, 5);
+      handCtx.fillStyle = "#ffae3d";
+      handCtx.fillRect(panelX + 120, panelY + panelHeight - 20, 82 * middlePower, 5);
+
+      // 瞄准指示器：小门框 + 准星位置
+      const aimBoxX = panelX + 12;
+      const aimBoxY = panelY + 32;
+      const aimBoxW = 66;
+      const aimBoxH = 88;
+      handCtx.fillStyle = "rgba(255,255,255,0.07)";
+      handCtx.strokeStyle = "rgba(255,255,255,0.22)";
+      handCtx.lineWidth = 1;
+      handCtx.fillRect(aimBoxX, aimBoxY, aimBoxW, aimBoxH);
+      handCtx.strokeRect(aimBoxX + 0.5, aimBoxY + 0.5, aimBoxW - 1, aimBoxH - 1);
+
+      // 准星位置映射到小门框
+      const aimDotX = aimBoxX + aimBoxW / 2 + (input.targetX / 3.72) * (aimBoxW / 2 - 4);
+      const aimDotY = aimBoxY + aimBoxH - 6 - ((input.targetY - 0.52) / (4.08 - 0.52)) * (aimBoxH - 12);
+      handCtx.fillStyle = input.gestureState === "LEFT FOOT" ? "#4ed3ff"
+        : input.gestureState === "RIGHT FOOT" ? "#ffae3d" : "#69e39f";
+      handCtx.shadowColor = handCtx.fillStyle;
+      handCtx.shadowBlur = 8;
+      handCtx.beginPath();
+      handCtx.arc(aimDotX, aimDotY, 4, 0, TAU);
+      handCtx.fill();
+      handCtx.shadowBlur = 0;
+
+      handCtx.restore();
+    }
+
+    initLights();
+    initField();
+    initStadium();
+    initGoal();
+    initKeeper();
+    initAim();
+    initTrail();
+    initBall();
+    initFeet();
+    resizeHandOverlay();
+    bindFallbackControls();
+    startHands();
+    requestAnimationFrame(animate);
+
+    function initLights() {
+      scene.add(new THREE.HemisphereLight(0xb9d5ff, 0x18371e, 1.45));
+
+      const key = new THREE.DirectionalLight(0xffffff, 2.1);
+      key.position.set(-12, 22, 14);
+      key.castShadow = true;
+      key.shadow.mapSize.set(2048, 2048);
+      key.shadow.camera.left = -20;
+      key.shadow.camera.right = 20;
+      key.shadow.camera.top = 24;
+      key.shadow.camera.bottom = -8;
+      scene.add(key);
+
+      const goalLight = new THREE.SpotLight(0xbfe6ff, 180, 60, Math.PI / 5, 0.42, 1.2);
+      goalLight.position.set(0, 20, -10);
+      goalLight.target.position.set(0, 1, GOAL_Z);
+      scene.add(goalLight, goalLight.target);
+    }
+
+    function grassTexture() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 512;
+      canvas.height = 512;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#17612d";
+      ctx.fillRect(0, 0, 512, 512);
+      for (let y = 0; y < 8; y++) {
+        ctx.fillStyle = y % 2 ? "rgba(255,255,255,0.025)" : "rgba(0,0,0,0.055)";
+        ctx.fillRect(0, y * 64, 512, 64);
+      }
+      for (let i = 0; i < 14000; i++) {
+        const green = 70 + Math.floor(Math.random() * 60);
+        ctx.fillStyle = `rgba(20,${green},38,0.25)`;
+        ctx.fillRect(Math.random() * 512, Math.random() * 512, 1, 2);
+      }
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
+      texture.repeat.set(5, 10);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      return texture;
+    }
+
+    function initField() {
+      const field = new THREE.Mesh(
+        new THREE.PlaneGeometry(32, 62),
+        new THREE.MeshStandardMaterial({ map: grassTexture(), roughness: 0.92, metalness: 0 })
+      );
+      field.rotation.x = -Math.PI / 2;
+      field.position.z = -5;
+      field.receiveShadow = true;
+      scene.add(field);
+
+      const groundBody = new CANNON.Body({ mass: 0, material: groundMaterial, shape: new CANNON.Plane() });
+      groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+      world.addBody(groundBody);
+
+      const lineMaterial = new THREE.LineBasicMaterial({ color: 0xe8eee9, transparent: true, opacity: 0.78 });
+      const markings = new THREE.Group();
+      markings.position.y = 0.018;
+
+      const rectangle = (width, depth, z) => {
+        const points = [
+          new THREE.Vector3(-width / 2, 0, z),
+          new THREE.Vector3(width / 2, 0, z),
+          new THREE.Vector3(width / 2, 0, z - depth),
+          new THREE.Vector3(-width / 2, 0, z - depth),
+          new THREE.Vector3(-width / 2, 0, z)
+        ];
+        const geometry = new THREE.BufferGeometry().setFromPoints(points);
+        markings.add(new THREE.Line(geometry, lineMaterial));
+      };
+
+      rectangle(20, 11, GOAL_Z + 0.1);
+      rectangle(9, 5.2, GOAL_Z + 0.1);
+
+      const spot = new THREE.Mesh(
+        new THREE.CircleGeometry(0.12, 24),
+        new THREE.MeshBasicMaterial({ color: 0xffffff })
+      );
+      spot.rotation.x = -Math.PI / 2;
+      spot.position.set(0, 0, BALL_START.z);
+      markings.add(spot);
+      scene.add(markings);
+    }
+
+    function initStadium() {
+      const standMaterial = new THREE.MeshStandardMaterial({ color: 0x121a17, roughness: 0.88 });
+      const seatColors = [0x1d6673, 0xd5b64b, 0xb84b3f, 0xe4e8e5];
+
+      for (const side of [-1, 1]) {
+        for (let tier = 0; tier < 5; tier++) {
+          const stand = new THREE.Mesh(new THREE.BoxGeometry(7, 1.1, 55), standMaterial);
+          stand.position.set(side * (18 + tier * 1.4), 0.55 + tier * 1.05, -5);
+          scene.add(stand);
+        }
+      }
+
+      const crowdCount = 3200;
+      const positions = new Float32Array(crowdCount * 3);
+      const colors = new Float32Array(crowdCount * 3);
+      const color = new THREE.Color();
+      for (let i = 0; i < crowdCount; i++) {
+        const side = Math.random() > 0.5 ? 1 : -1;
+        const tier = Math.floor(Math.random() * 5);
+        const index = i * 3;
+        positions[index] = side * (15.1 + tier * 1.42 + Math.random() * 1.1);
+        positions[index + 1] = 1.35 + tier * 1.05 + Math.random() * 0.75;
+        positions[index + 2] = -32 + Math.random() * 55;
+        color.setHex(seatColors[Math.floor(Math.random() * seatColors.length)]);
+        colors[index] = color.r;
+        colors[index + 1] = color.g;
+        colors[index + 2] = color.b;
+      }
+      const crowdGeometry = new THREE.BufferGeometry();
+      crowdGeometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      crowdGeometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      scene.add(new THREE.Points(crowdGeometry, new THREE.PointsMaterial({ size: 0.14, vertexColors: true })));
+
+      for (const x of [-13, 13]) {
+        const pole = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.12, 0.18, 17, 10),
+          new THREE.MeshStandardMaterial({ color: 0x69716e, metalness: 0.7, roughness: 0.35 })
+        );
+        pole.position.set(x, 8.5, -13);
+        scene.add(pole);
+
+        const lamp = new THREE.Mesh(
+          new THREE.BoxGeometry(3.8, 0.9, 0.45),
+          new THREE.MeshBasicMaterial({ color: 0xe6f4ff })
+        );
+        lamp.position.set(x, 17, -13);
+        scene.add(lamp);
+      }
+    }
+
+    function addStaticBox(size, position, material = postMaterial) {
+      const body = new CANNON.Body({
+        mass: 0,
+        material,
+        shape: new CANNON.Box(new CANNON.Vec3(size.x / 2, size.y / 2, size.z / 2))
+      });
+      body.position.set(position.x, position.y, position.z);
+      world.addBody(body);
+      return body;
+    }
+
+    function netGrid(width, height, depth) {
+      const points = [];
+      const xSteps = 16;
+      const ySteps = 9;
+      const zBack = GOAL_Z - depth;
+      for (let i = 0; i <= xSteps; i++) {
+        const x = -width / 2 + width * (i / xSteps);
+        points.push(x, 0.12, GOAL_Z - 0.12, x, height, GOAL_Z - 0.12);
+        points.push(x, 0.12, zBack, x, height, zBack);
+        points.push(x, height, GOAL_Z - 0.12, x, height, zBack);
+      }
+      for (let i = 0; i <= ySteps; i++) {
+        const y = 0.12 + (height - 0.12) * (i / ySteps);
+        points.push(-width / 2, y, GOAL_Z - 0.12, width / 2, y, GOAL_Z - 0.12);
+        points.push(-width / 2, y, zBack, width / 2, y, zBack);
+      }
+      for (const x of [-width / 2, width / 2]) {
+        for (let i = 0; i <= ySteps; i++) {
+          const y = 0.12 + (height - 0.12) * (i / ySteps);
+          points.push(x, y, GOAL_Z - 0.12, x, y, zBack);
+        }
+      }
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(points, 3));
+      return new THREE.LineSegments(
+        geometry,
+        new THREE.LineBasicMaterial({ color: 0xdde8e2, transparent: true, opacity: 0.32 })
+      );
+    }
+
+    function initGoal() {
+      const postVisualMaterial = new THREE.MeshStandardMaterial({ color: 0xf7faf8, roughness: 0.35 });
+      const postGeometry = new THREE.CylinderGeometry(0.12, 0.12, GOAL_HEIGHT, 18);
+      for (const x of [-GOAL_WIDTH / 2, GOAL_WIDTH / 2]) {
+        const post = new THREE.Mesh(postGeometry, postVisualMaterial);
+        post.position.set(x, GOAL_HEIGHT / 2, GOAL_Z);
+        post.castShadow = true;
+        scene.add(post);
+        addStaticBox(new THREE.Vector3(0.24, GOAL_HEIGHT, 0.24), post.position);
+      }
+
+      const crossbar = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.12, 0.12, GOAL_WIDTH + 0.24, 18),
+        postVisualMaterial
+      );
+      crossbar.rotation.z = Math.PI / 2;
+      crossbar.position.set(0, GOAL_HEIGHT, GOAL_Z);
+      crossbar.castShadow = true;
+      scene.add(crossbar);
+      addStaticBox(new THREE.Vector3(GOAL_WIDTH + 0.24, 0.24, 0.24), crossbar.position);
+      scene.add(netGrid(GOAL_WIDTH, GOAL_HEIGHT, 2.3));
+
+      for (const x of [-3.18, 3.18]) {
+        const ring = new THREE.Mesh(
+          new THREE.TorusGeometry(0.48, 0.035, 10, 40),
+          new THREE.MeshBasicMaterial({ color: 0xf6c74c, transparent: true, opacity: 0.72 })
+        );
+        ring.position.set(x, 3.55, GOAL_Z + 0.06);
+        ring.userData.baseX = x;
+        targetRings.push(ring);
+        scene.add(ring);
+      }
+    }
+
+    function initKeeper() {
+      keeperGroup = new THREE.Group();
+      const jersey = new THREE.MeshStandardMaterial({ color: 0xe5532f, roughness: 0.68 });
+      const dark = new THREE.MeshStandardMaterial({ color: 0x17211e, roughness: 0.76 });
+      const skin = new THREE.MeshStandardMaterial({ color: 0xc98b67, roughness: 0.78 });
+
+      const torso = new THREE.Mesh(new THREE.BoxGeometry(1.35, 1.65, 0.55), jersey);
+      torso.position.y = 1.65;
+      const head = new THREE.Mesh(new THREE.SphereGeometry(0.34, 18, 14), skin);
+      head.position.y = 2.78;
+      const legs = new THREE.Mesh(new THREE.BoxGeometry(1.05, 1.1, 0.45), dark);
+      legs.position.y = 0.55;
+      keeperGroup.add(torso, head, legs);
+
+      for (const side of [-1, 1]) {
+        const arm = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.28, 0.32), jersey);
+        arm.position.set(side * 1.05, 1.9, 0);
+        arm.rotation.z = side * 0.18;
+        arm.name = side < 0 ? "leftArm" : "rightArm";
+        keeperGroup.add(arm);
+      }
+      keeperGroup.position.set(0, 0, GOAL_Z + 0.72);
+      keeperGroup.traverse(object => { if (object.isMesh) object.castShadow = true; });
+      scene.add(keeperGroup);
+
+      keeperBody = new CANNON.Body({
+        mass: 0,
+        type: CANNON.Body.KINEMATIC,
+        material: postMaterial,
+        shape: new CANNON.Box(new CANNON.Vec3(1.35, 1.55, 0.38))
+      });
+      keeperBody.position.set(0, 1.5, GOAL_Z + 0.72);
+      world.addBody(keeperBody);
+    }
+
+    function footballTexture() {
+      const canvas = document.createElement("canvas");
+      canvas.width = 512;
+      canvas.height = 256;
+      const ctx = canvas.getContext("2d");
+      ctx.fillStyle = "#f4f4ef";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = "#a8aaa5";
+      ctx.lineWidth = 2;
+      for (let y = 0; y < 5; y++) {
+        for (let x = 0; x < 10; x++) {
+          const cx = 28 + x * 52 + (y % 2) * 25;
+          const cy = 26 + y * 52;
+          ctx.beginPath();
+          for (let n = 0; n < 5; n++) {
+            const angle = -Math.PI / 2 + n * TAU / 5;
+            const px = cx + Math.cos(angle) * 12;
+            const py = cy + Math.sin(angle) * 12;
+            n ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+          }
+          ctx.closePath();
+          if ((x + y * 3) % 4 === 0) {
+            ctx.fillStyle = "#171918";
+            ctx.fill();
+          }
+          ctx.stroke();
+        }
+      }
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      return texture;
+    }
+
+    function initBall() {
+      ballMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.34, 40, 28),
+        new THREE.MeshStandardMaterial({ map: footballTexture(), roughness: 0.55 })
+      );
+      ballMesh.castShadow = true;
+      ballMesh.receiveShadow = true;
+      scene.add(ballMesh);
+
+      ballBody = new CANNON.Body({
+        mass: 0.43,
+        material: ballMaterial,
+        shape: new CANNON.Sphere(0.34),
+        linearDamping: 0.012,
+        angularDamping: 0.02,
+        sleepSpeedLimit: 0.1,
+        sleepTimeLimit: 0.6
+      });
+      ballBody.addEventListener("collide", event => {
+        if (game.shotActive && event.body === keeperBody && !game.resolved) {
+          game.saved = true;
+          resolveShot("SAVED", 0);
+        }
+      });
+      world.addBody(ballBody);
+      resetBall(true);
+    }
+
+    function createFoot(color) {
+      const group = new THREE.Group();
+      const material = new THREE.MeshStandardMaterial({ color, roughness: 0.58, metalness: 0.08 });
+      const soleMaterial = new THREE.MeshStandardMaterial({ color: 0xf2f4f3, roughness: 0.82 });
+      const shoe = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.24, 0.92), material);
+      shoe.position.z = -0.10;
+      shoe.rotation.x = -0.08;
+      const toe = new THREE.Mesh(new THREE.SphereGeometry(0.25, 18, 12), material);
+      toe.scale.set(1, 0.54, 1.20);
+      toe.position.set(0, 0.01, -0.55);
+      const sole = new THREE.Mesh(new THREE.BoxGeometry(0.50, 0.055, 1.02), soleMaterial);
+      sole.position.set(0, -0.14, -0.10);
+      const ankle = new THREE.Mesh(new THREE.BoxGeometry(0.31, 0.42, 0.34), material);
+      ankle.position.set(0, 0.27, 0.22);
+      group.add(shoe, toe, sole, ankle);
+      group.traverse(object => {
+        if (object.isMesh) object.castShadow = true;
+      });
+      return group;
+    }
+
+    function initFeet() {
+      leftFoot = createFoot(0x38bde8);
+      rightFoot = createFoot(0xf29b32);
+      leftFoot.position.set(-0.68, 0.24, 7.28);
+      rightFoot.position.set(0.68, 0.24, 7.28);
+      leftFoot.rotation.y = -0.10;
+      rightFoot.rotation.y = 0.10;
+      scene.add(leftFoot, rightFoot);
+    }
+
+    function updateFeet(now) {
+      const feet = [
+        { mesh: leftFoot, name: "LEFT", x: -0.68, angle: -0.10 },
+        { mesh: rightFoot, name: "RIGHT", x: 0.68, angle: 0.10 }
+      ];
+      for (const foot of feet) {
+        let kick = 0;
+        if (input.footKick?.foot === foot.name) {
+          const progress = clamp((now - input.footKick.startedAt) / 330, 0, 1);
+          kick = Math.sin(progress * Math.PI);
+          if (progress >= 1) input.footKick = null;
+        }
+        foot.mesh.position.set(foot.x, 0.24 + kick * 0.16, 7.28 - kick * 1.22);
+        foot.mesh.rotation.set(-kick * 0.34, foot.angle, foot.name === "LEFT" ? -0.03 : 0.03);
+      }
+    }
+
+    function initAim() {
+      reticleMaterial = new THREE.MeshBasicMaterial({ color: 0x69e39f, transparent: true, opacity: 0.88 });
+      reticle = new THREE.Group();
+      const outer = new THREE.Mesh(new THREE.TorusGeometry(0.32, 0.025, 8, 40), reticleMaterial);
+      const inner = new THREE.Mesh(new THREE.TorusGeometry(0.095, 0.018, 8, 30), reticleMaterial);
+      reticle.add(outer, inner);
+      reticle.position.set(0, input.aimY, GOAL_Z + 0.08);
+      scene.add(reticle);
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(new Float32Array(26 * 3), 3));
+      guideLine = new THREE.Line(
+        geometry,
+        new THREE.LineDashedMaterial({ color: 0xdbe7df, transparent: true, opacity: 0.24, dashSize: 0.22, gapSize: 0.22 })
+      );
+      scene.add(guideLine);
+    }
+
+    function initTrail() {
+      trailPositions = new Float32Array(36 * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(trailPositions, 3));
+      trail = new THREE.Line(
+        geometry,
+        new THREE.LineBasicMaterial({ color: 0xa8e7ff, transparent: true, opacity: 0.50 })
+      );
+      trail.visible = false;
+      scene.add(trail);
+    }
+
+    function resetBall(initial = false) {
+      ballBody.position.set(BALL_START.x, BALL_START.y, BALL_START.z);
+      ballBody.velocity.setZero();
+      ballBody.angularVelocity.setZero();
+      ballBody.quaternion.set(0, 0, 0, 1);
+      ballBody.force.setZero();
+      ballBody.torque.setZero();
+      ballBody.wakeUp();
+      game.shotActive = false;
+      game.saved = false;
+      game.resolved = false;
+      game.lastBallZ = BALL_START.z;
+      game.resetAt = 0;
+      trailHead = 0;
+      trailCount = 0;
+      trail.visible = false;
+      reticle.visible = !game.finished;
+      guideLine.visible = !game.finished;
+      if (!initial) keeperReactionAt = 0;
+    }
+
+    function shoot(power = 1, curve = 0) {
+      const now = performance.now();
+      if (game.finished || game.shotActive || now < input.cooldownUntil) return false;
+
+      const flightTime = THREE.MathUtils.lerp(0.92, 0.68, clamp(power, 0, 1));
+      const targetY = clamp(input.aimY, 0.55, GOAL_HEIGHT - 0.24);
+      const vx = (input.aimX - BALL_START.x) / flightTime;
+      const vz = (GOAL_Z - 0.35 - BALL_START.z) / flightTime;
+      const vy = (targetY - BALL_START.y - 0.5 * world.gravity.y * flightTime * flightTime) / flightTime;
+
+      ballBody.velocity.set(vx, vy, vz);
+      ballBody.angularVelocity.set(8 + Math.abs(curve) * 8, curve * 18, -vx * 0.65);
+      ballBody.wakeUp();
+      game.shotActive = true;
+      game.shotAt = now;
+      game.shotCurve = clamp(curve, -1, 1);
+      game.shotTargetX = input.aimX;
+      game.saved = false;
+      game.resolved = false;
+      game.shots++;
+      keeperReactionAt = now + 150 + Math.random() * 110;
+      input.cooldownUntil = now + 900;
+      reticle.visible = false;
+      guideLine.visible = false;
+      trail.visible = true;
+      return true;
+    }
+
+    function pointsForGoal(x, y) {
+      if (Math.abs(x) > 2.65 && y > 2.75) return 3;
+      if (Math.abs(x) > 2.7 || y > 3.15) return 2;
+      return 1;
+    }
+
+    function resolveShot(label, basePoints) {
+      if (game.resolved) return;
+      game.resolved = true;
+      if (basePoints > 0) {
+        game.goals++;
+        game.combo++;
+        const comboBonus = Math.floor(game.combo / 3);
+        const awarded = basePoints + comboBonus;
+        game.score += awarded;
+        showFeedback(label, `+${awarded}`);
+      } else {
+        game.combo = 0;
+        showFeedback(label, "");
+      }
+      syncHud();
+      game.resetAt = performance.now() + 1450;
+    }
+
+    function showFeedback(label, detail) {
+      feedbackNode.innerHTML = `${label}${detail ? `<span>${detail}</span>` : ""}`;
+      feedbackNode.classList.add("show");
+      clearTimeout(game.feedbackTimer);
+      game.feedbackTimer = setTimeout(() => feedbackNode.classList.remove("show"), 900);
+    }
+
+    function syncHud() {
+      scoreNode.textContent = game.score;
+      comboNode.textContent = `x${Math.max(1, game.combo)}`;
+      timeNode.textContent = Math.max(0, Math.ceil(game.remaining));
+    }
+
+    function updateAim(dt) {
+      const ease = 1 - Math.exp(-dt * 10);
+      input.aimX += (input.targetX - input.aimX) * ease;
+      input.aimY += (input.targetY - input.aimY) * ease;
+      reticle.position.set(input.aimX, input.aimY, GOAL_Z + 0.08);
+      reticle.rotation.z += dt * (0.55 + input.wavePower * 1.2);
+      const colors = {
+        "FEET READY": 0x69e39f,
+        "LEFT FOOT": 0x4ed3ff,
+        "RIGHT FOOT": 0xffae3d,
+        COOLDOWN: 0x8e9996
+      };
+      reticleMaterial.color.setHex(input.handVisible ? (colors[input.gestureState] || 0x69e39f) : 0xe5c75b);
+      reticle.scale.setScalar(1 + input.wavePower * 0.10);
+      if (!input.handVisible) input.wavePower *= Math.pow(0.03, dt);
+      powerFill.style.width = `${Math.round(clamp(input.wavePower, 0, 1) * 100)}%`;
+      powerFill.style.backgroundColor = input.gestureState === "LEFT FOOT"
+        ? "#4ed3ff"
+        : input.gestureState === "RIGHT FOOT"
+          ? "#ffae3d"
+          : "#65df9b";
+      updateGuide();
+    }
+
+    function updateGuide() {
+      if (!guideLine.visible) return;
+      const positions = guideLine.geometry.attributes.position.array;
+      const flightTime = 0.78;
+      const vx = (input.aimX - BALL_START.x) / flightTime;
+      const vz = (GOAL_Z - 0.35 - BALL_START.z) / flightTime;
+      const vy = (input.aimY - BALL_START.y - 0.5 * world.gravity.y * flightTime * flightTime) / flightTime;
+      for (let i = 0; i < 26; i++) {
+        const t = flightTime * (i / 25);
+        const index = i * 3;
+        positions[index] = BALL_START.x + vx * t;
+        positions[index + 1] = BALL_START.y + vy * t + 0.5 * world.gravity.y * t * t;
+        positions[index + 2] = BALL_START.z + vz * t;
+      }
+      guideLine.geometry.attributes.position.needsUpdate = true;
+      guideLine.computeLineDistances();
+    }
+
+    function updateKeeper(now, dt) {
+      if (game.shotActive && now > keeperReactionAt) {
+        keeperTargetX = clamp(game.shotTargetX * 0.92 + game.shotCurve * 0.32, -3.0, 3.0);
+      } else if (!game.shotActive) {
+        keeperTargetX = Math.sin(now * 0.00115) * 2.1;
+      }
+
+      const maxSpeed = game.shotActive ? 8.4 : 2.4;
+      const delta = clamp(keeperTargetX - keeperBody.position.x, -maxSpeed * dt, maxSpeed * dt);
+      keeperBody.position.x += delta;
+      keeperBody.velocity.x = dt > 0 ? delta / dt : 0;
+      keeperGroup.position.x = keeperBody.position.x;
+
+      const dive = game.shotActive ? clamp(Math.abs(keeperBody.velocity.x) / 8.4, 0, 1) : 0;
+      keeperGroup.rotation.z = -Math.sign(keeperBody.velocity.x) * dive * 0.28;
+      const leftArm = keeperGroup.getObjectByName("leftArm");
+      const rightArm = keeperGroup.getObjectByName("rightArm");
+      leftArm.rotation.z = -0.18 + dive * 0.42;
+      rightArm.rotation.z = 0.18 - dive * 0.42;
+    }
+
+    function updateBall(now, dt) {
+      if (game.shotActive && !game.resolved) {
+        const speedZ = Math.abs(ballBody.velocity.z);
+        ballBody.force.x += game.shotCurve * speedZ * 0.17;
+
+        if (ballBody.position.z < GOAL_Z && game.lastBallZ >= GOAL_Z) {
+          const inside = Math.abs(ballBody.position.x) < GOAL_WIDTH / 2 - 0.12 &&
+            ballBody.position.y > 0.22 && ballBody.position.y < GOAL_HEIGHT - 0.08;
+          if (inside && !game.saved) {
+            resolveShot("GOAL", pointsForGoal(ballBody.position.x, ballBody.position.y));
+          } else {
+            resolveShot("MISS", 0);
+          }
+        } else if (
+          ballBody.position.y < -1 ||
+          Math.abs(ballBody.position.x) > 13 ||
+          ballBody.position.z < GOAL_Z - 6 ||
+          now - game.shotAt > 4200
+        ) {
+          resolveShot("MISS", 0);
+        }
+
+        game.lastBallZ = ballBody.position.z;
+      }
+
+      if (game.resetAt && now > game.resetAt) resetBall();
+
+      ballMesh.position.copy(ballBody.position);
+      ballMesh.quaternion.copy(ballBody.quaternion);
+      updateTrail();
+    }
+
+    function updateTrail() {
+      if (!game.shotActive) return;
+      trailHead = (trailHead + 1) % 36;
+      trailCount = Math.min(36, trailCount + 1);
+      const ordered = new Float32Array(36 * 3);
+      trailPositions[trailHead * 3] = ballBody.position.x;
+      trailPositions[trailHead * 3 + 1] = ballBody.position.y;
+      trailPositions[trailHead * 3 + 2] = ballBody.position.z;
+      for (let i = 0; i < trailCount; i++) {
+        const source = (trailHead - trailCount + 1 + i + 36) % 36;
+        ordered[i * 3] = trailPositions[source * 3];
+        ordered[i * 3 + 1] = trailPositions[source * 3 + 1];
+        ordered[i * 3 + 2] = trailPositions[source * 3 + 2];
+      }
+      trail.geometry.setAttribute("position", new THREE.BufferAttribute(ordered, 3));
+      trail.geometry.setDrawRange(0, trailCount);
+    }
+
+    function updateRound(now) {
+      if (game.finished) {
+        if (now > game.nextRoundAt) restartRound();
+        return;
+      }
+      game.remaining = ROUND_SECONDS - (now - game.startedAt) / 1000;
+      if (game.remaining <= 0) {
+        game.remaining = 0;
+        game.finished = true;
+        game.nextRoundAt = now + 4200;
+        reticle.visible = false;
+        guideLine.visible = false;
+        showFeedback("FULL TIME", `${game.score} PTS`);
+      }
+      syncHud();
+    }
+
+    function restartRound() {
+      game.score = 0;
+      game.combo = 0;
+      game.shots = 0;
+      game.goals = 0;
+      game.startedAt = performance.now();
+      game.remaining = ROUND_SECONDS;
+      game.finished = false;
+      game.nextRoundAt = 0;
+      resetBall();
+      syncHud();
+    }
+
+    function updateTargets(now) {
+      targetRings.forEach((ring, index) => {
+        const pulse = 1 + Math.sin(now * 0.003 + index * Math.PI) * 0.08;
+        ring.scale.setScalar(pulse);
+        ring.material.opacity = 0.55 + Math.sin(now * 0.004 + index) * 0.16;
+      });
+    }
+
+    function animate(now) {
+      requestAnimationFrame(animate);
+      const dt = Math.min(0.10, (now - lastRender) / 1000 || 0.016);
+      lastRender = now;
+
+      updateAim(dt);
+      updateKeeper(now, dt);
+      if (game.shotActive && !game.resolved) {
+        ballBody.force.x += game.shotCurve * Math.abs(ballBody.velocity.z) * 0.12;
+      }
+      world.step(1 / 120, dt, 12);
+      updateBall(now, dt);
+      updateRound(now);
+      updateTargets(now);
+      updateFeet(now);
+
+      camera.position.x += ((input.aimX * 0.05) - camera.position.x) * (1 - Math.exp(-dt * 2));
+      tempVector.set(input.aimX * 0.06, 1.55 + input.aimY * 0.015, -11.5);
+      camera.lookAt(tempVector);
+      renderer.render(scene, camera);
+    }
+
+    function resetFingerControls(resetTracking = false) {
+      input.wavePower = 0;
+      input.gestureState = performance.now() < input.cooldownUntil ? "COOLDOWN" : "FEET READY";
+      for (const finger of Object.values(input.fingers)) {
+        finger.velocity = 0;
+        finger.progress = 0;
+        if (resetTracking) {
+          finger.previous = null;
+          finger.baseline = null;
+          finger.armed = true;
+        }
+      }
+      if (resetTracking) input.previousTime = 0;
+    }
+
+    function fingerAdvance(landmarks, tipIndex, baseIndex, palmWidth, forward) {
+      const tip = landmarks[tipIndex];
+      const base = landmarks[baseIndex];
+      const screenAdvance = ((tip.x - base.x) * forward.x + (tip.y - base.y) * forward.y) / palmWidth;
+      const depthAdvance = ((base.z || 0) - (tip.z || 0)) / palmWidth;
+      return screenAdvance + depthAdvance * 0.65;
+    }
+
+    function updateFinger(name, advance, elapsed, now) {
+      const finger = input.fingers[name];
+      if (finger.previous === null) {
+        finger.previous = advance;
+        finger.baseline = advance;
+        return null;
+      }
+
+      // advance 表示指尖相对指根的前伸量，弯曲时 advance 减小
+      const rawVelocity = (advance - finger.previous) / elapsed;
+      finger.velocity += (rawVelocity - finger.velocity) * 0.58;
+      const excursion = advance - finger.baseline; // 弯曲时为负值
+      // progress：弯曲程度（0=伸直，1=完全弯曲）
+      finger.progress = clamp(Math.max(
+        -excursion / FINGER_KICK_DISTANCE,
+        -finger.velocity / FINGER_KICK_SPEED * 0.55
+      ), 0, 1);
+
+      // 重新蓄力：手指重新伸直
+      if (!finger.armed && excursion > -FINGER_REARM_DISTANCE && finger.velocity > -0.35) {
+        finger.armed = true;
+        finger.baseline = advance;
+      } else if (finger.armed && Math.abs(finger.velocity) < 0.16) {
+        // 手指静止时缓慢更新基线
+        finger.baseline += (advance - finger.baseline) * 0.055;
+      }
+
+      const canKick = !game.shotActive && now >= input.cooldownUntil;
+      // 检测快速弯曲：velocity 为负（弯曲方向）且弯曲幅度足够
+      const triggered = canKick && finger.armed &&
+        finger.velocity < -FINGER_KICK_SPEED && excursion < -FINGER_KICK_DISTANCE;
+      finger.previous = advance;
+
+      if (!triggered) return null;
+      finger.armed = false;
+      return clamp(0.70 + finger.progress * 0.30, 0.70, 1);
+    }
+
+    function kickWithFoot(foot, power, now) {
+      const left = foot === "LEFT";
+      // 瞄准方向由手在画面中的位置决定（已在 handleHandLandmarks 中持续更新）
+      // 力度微调高度：power 越大射得越高
+      input.targetY = clamp(input.targetY + (power - 0.85) * 1.2, 0.52, 4.08);
+      input.aimX = input.targetX;
+      input.aimY = input.targetY;
+      input.activeFoot = foot;
+      input.footKick = { foot, startedAt: now };
+      input.gestureState = `${foot} FOOT`;
+      input.wavePower = power;
+      if (shoot(power, left ? 0.38 : -0.38)) {
+        input.gestureState = "COOLDOWN";
+        cameraLabel.textContent = `${foot} KICK`;
+        return true;
+      }
+      return false;
+    }
+
+    function handleHandLandmarks(landmarks, now = performance.now()) {
+      if (!landmarks) {
+        input.missingFrames++;
+        if (input.missingFrames <= 3) return;
+        input.handVisible = false;
+        cameraState.classList.remove("active");
+        cameraLabel.textContent = "MOUSE";
+        resetFingerControls(true);
+        clearHandOverlay();
+        return;
+      }
+
+      input.missingFrames = 0;
+
+      const elapsed = input.previousTime
+        ? clamp((now - input.previousTime) / 1000, 0.016, 0.10)
+        : 0.033;
+      const palmWidth = Math.max(0.025, Math.hypot(
+        landmarks[5].x - landmarks[17].x,
+        landmarks[5].y - landmarks[17].y
+      ));
+      const forwardX = (landmarks[5].x + landmarks[9].x) * 0.5 - landmarks[0].x;
+      const forwardY = (landmarks[5].y + landmarks[9].y) * 0.5 - landmarks[0].y;
+      const forwardLength = Math.max(0.001, Math.hypot(forwardX, forwardY));
+      const forward = { x: forwardX / forwardLength, y: forwardY / forwardLength };
+
+      const indexAdvance = fingerAdvance(landmarks, 8, 5, palmWidth, forward);
+      const middleAdvance = fingerAdvance(landmarks, 12, 9, palmWidth, forward);
+      const indexKick = updateFinger("index", indexAdvance, elapsed, now);
+      const middleKick = updateFinger("middle", middleAdvance, elapsed, now);
+
+      // 用手掌在画面中的位置控制瞄准方向（非线性映射 + 平滑）
+      const handCenterX = (landmarks[0].x + landmarks[5].x + landmarks[9].x + landmarks[13].x + landmarks[17].x) / 5;
+      const handCenterY = (landmarks[0].y + landmarks[5].y + landmarks[9].y + landmarks[13].y + landmarks[17].y) / 5;
+      // 将手部坐标映射到球门范围，使用轻微非线性过滤手部微颤
+      const rawX = (handCenterX - 0.5) * 2; // -1 ~ 1
+      const rawY = (0.5 - handCenterY) * 2; // -1 ~ 1（翻转）
+      const curveX = Math.sign(rawX) * Math.pow(Math.abs(rawX), 0.85);
+      const curveY = Math.sign(rawY) * Math.pow(Math.abs(rawY), 0.85);
+      const goalTargetX = curveX * 3.72;
+      const goalTargetY = 2.3 + curveY * 1.78;
+      // 指数平滑，减少手部追踪抖动
+      const smoothFactor = clamp(elapsed * 10.0, 0.15, 0.65);
+      input.targetSmoothX += (goalTargetX - input.targetSmoothX) * smoothFactor;
+      input.targetSmoothY += (goalTargetY - input.targetSmoothY) * smoothFactor;
+      input.targetX = input.targetSmoothX;
+      input.targetY = input.targetSmoothY;
+
+      input.handVisible = true;
+      cameraState.classList.add("active");
+      input.handSpeed = Math.max(input.fingers.index.velocity, input.fingers.middle.velocity, 0);
+      input.wavePower = Math.max(input.fingers.index.progress, input.fingers.middle.progress);
+
+      if (indexKick !== null) {
+        kickWithFoot("LEFT", indexKick, now);
+      } else if (middleKick !== null) {
+        kickWithFoot("RIGHT", middleKick, now);
+      } else if (now < input.cooldownUntil || game.shotActive) {
+        input.gestureState = "COOLDOWN";
+      } else {
+        input.gestureState = "FEET READY";
+        cameraLabel.textContent = "TWO FEET";
+      }
+
+      drawHandOverlay(landmarks, input.fingers, input.gestureState);
+      input.previousTime = now;
+    }
+
+    function processHands(results) {
+      const now = performance.now();
+      if (now < handOverlayHoldUntil) return;
+      handleHandLandmarks(results.multiHandLandmarks?.[0] || null, now);
+    }
+
+    async function startHands() {
+      try {
+        await new Promise(resolve => window.addEventListener("load", resolve, { once: true }));
+        if (!window.Hands || !window.Camera) throw new Error("MediaPipe unavailable");
+
+        hands = new Hands({
+          locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        hands.setOptions({
+          maxNumHands: 1,
+          modelComplexity: 1,
+          selfieMode: true,
+          minDetectionConfidence: 0.58,
+          minTrackingConfidence: 0.54
+        });
+        hands.onResults(processHands);
+
+        mediaCamera = new Camera(video, {
+          width: 640,
+          height: 360,
+          onFrame: async () => hands.send({ image: video })
+        });
+        await mediaCamera.start();
+        cameraState.classList.add("active");
+        cameraLabel.textContent = "TWO FEET";
+      } catch (error) {
+        console.warn(error);
+        cameraState.classList.remove("active");
+        cameraLabel.textContent = "MOUSE";
+      }
+    }
+
+    function bindFallbackControls() {
+      renderer.domElement.addEventListener("pointermove", event => {
+        if (input.handVisible) return;
+        input.targetX = clamp((event.clientX / innerWidth - 0.5) * 8.3, -3.72, 3.72);
+        input.targetY = clamp((1 - event.clientY / innerHeight) * 5.1 - 0.1, 0.52, 4.08);
+      });
+      renderer.domElement.addEventListener("pointerdown", () => {
+        if (!input.handVisible) shoot(0.88, 0);
+      });
+      window.addEventListener("keydown", event => {
+        if (event.code === "Space") {
+          event.preventDefault();
+          shoot(0.92, 0);
+        }
+      });
+      window.addEventListener("resize", () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+        renderer.setSize(innerWidth, innerHeight);
+        resizeHandOverlay();
+      });
+      window.addEventListener("beforeunload", () => {
+        if (mediaCamera && typeof mediaCamera.stop === "function") mediaCamera.stop();
+        if (hands && typeof hands.close === "function") hands.close();
+        if (video.srcObject) video.srcObject.getTracks().forEach(track => track.stop());
+      });
+    }
+
+    function makeTestHand(centerX = 0.5, centerY = 0.58, open = true) {
+      const landmarks = Array.from({ length: 21 }, () => ({ x: centerX, y: centerY, z: 0 }));
+      landmarks[0] = { x: centerX, y: centerY + 0.16, z: 0 };
+      const fingers = [
+        [1, 2, 3, 4],
+        [5, 6, 7, 8],
+        [9, 10, 11, 12],
+        [13, 14, 15, 16],
+        [17, 18, 19, 20]
+      ];
+      fingers.forEach((finger, fingerIndex) => {
+        finger.forEach((landmarkIndex, jointIndex) => {
+          const spread = (fingerIndex - 2) * 0.045;
+          landmarks[landmarkIndex] = open
+            ? {
+                x: centerX + spread + (fingerIndex === 0 ? -jointIndex * 0.020 : 0),
+                y: centerY + 0.06 - jointIndex * 0.092,
+                z: 0
+              }
+            : {
+                x: centerX + spread * 0.72,
+                y: centerY + 0.035 + jointIndex * 0.012,
+                z: 0
+              };
+        });
+      });
+      return landmarks;
+    }
+
+    function moveTestFinger(landmarks, foot, amount) {
+      const indexes = foot === "LEFT" ? [7, 8] : [11, 12];
+      landmarks[indexes[0]].y -= amount * 0.45;
+      landmarks[indexes[1]].y -= amount;
+      landmarks[indexes[1]].z -= amount * 0.40;
+      return landmarks;
+    }
+
+    window.__footballGame = {
+      setAim(x, y) {
+        input.targetX = clamp(x, -3.72, 3.72);
+        input.targetY = clamp(y, 0.52, 4.08);
+        input.aimX = input.targetX;
+        input.aimY = input.targetY;
+        return { x: input.aimX, y: input.aimY };
+      },
+      shoot(power = 0.9, curve = 0) {
+        return shoot(power, curve);
+      },
+      showTestHand(foot = "") {
+        handOverlayHoldUntil = performance.now() + 1600;
+        const landmarks = makeTestHand();
+        if (foot) moveTestFinger(landmarks, foot, 0.07);
+        drawHandOverlay(landmarks, input.fingers, foot ? `${foot} FOOT` : "FEET READY");
+        return landmarks.length;
+      },
+      feedTestHand(x = 0.5, y = 0.58, open = true) {
+        handOverlayHoldUntil = performance.now() + 1600;
+        handleHandLandmarks(makeTestHand(x, y, open), performance.now());
+        return {
+          gestureState: input.gestureState,
+          fingers: input.fingers,
+          shots: game.shots
+        };
+      },
+      feedTestFinger(foot = "LEFT", amount = 0) {
+        handOverlayHoldUntil = performance.now() + 1600;
+        const landmarks = moveTestFinger(makeTestHand(), foot, amount);
+        handleHandLandmarks(landmarks, performance.now());
+        return {
+          gestureState: input.gestureState,
+          activeFoot: input.activeFoot,
+          shots: game.shots,
+          index: { ...input.fingers.index },
+          middle: { ...input.fingers.middle }
+        };
+      },
+      state() {
+        return {
+          score: game.score,
+          combo: game.combo,
+          shots: game.shots,
+          goals: game.goals,
+          remaining: game.remaining,
+          shotActive: game.shotActive,
+          keeperX: keeperBody.position.x,
+          gestureState: input.gestureState,
+          activeFoot: input.activeFoot,
+          handSpeed: input.handSpeed,
+          fingers: {
+            index: { progress: input.fingers.index.progress, velocity: input.fingers.index.velocity, armed: input.fingers.index.armed },
+            middle: { progress: input.fingers.middle.progress, velocity: input.fingers.middle.velocity, armed: input.fingers.middle.armed }
+          },
+          aim: { x: input.aimX, y: input.aimY },
+          ball: { x: ballBody.position.x, y: ballBody.position.y, z: ballBody.position.z }
+        };
+      }
+    };
+  </script>
+</body>
+</html>

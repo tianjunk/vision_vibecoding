@@ -1,0 +1,1187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>透明水滴代码人</title>
+  <link rel="icon" href="data:," />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/selfie_segmentation.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <style>
+    html,
+    body,
+    .app {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #050808;
+    }
+
+    video {
+      display: none;
+    }
+
+    #stage {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #050808;
+    }
+
+    #particles {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 10;
+    }
+
+    @keyframes shake {
+      0%, 100% { transform: translate3d(0, 0, 0); }
+      10%, 30%, 50%, 70%, 90% { transform: translate3d(-18px, 12px, 0); }
+      20%, 40%, 60%, 80% { transform: translate3d(18px, -12px, 0); }
+    }
+    
+    .shake-active {
+      animation: shake 0.4s cubic-bezier(.36,.07,.19,.97) both;
+    }
+  </style>
+</head>
+<body>
+  <main class="app" id="app">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="stage" aria-label="透明水滴代码人实时画面"></canvas>
+    <canvas id="particles" aria-hidden="true"></canvas>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const WIDTH = 1280;
+      const HEIGHT = 720;
+      const FONT_SIZE = 12;
+      const COLS = Math.floor(WIDTH / FONT_SIZE);
+      const CHARS = "0101010110011010SYSTEMVOIDNULLRAIN{}[]<>/\\#$%&*ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      const MASK_SCAN_STEP = 8;
+
+      const video = document.getElementById("video");
+      const canvas = document.getElementById("stage");
+      const particlesCanvas = document.getElementById("particles");
+
+      canvas.width = WIDTH;
+      canvas.height = HEIGHT;
+      particlesCanvas.width = WIDTH;
+      particlesCanvas.height = HEIGHT;
+      const pCtx = particlesCanvas.getContext("2d");
+      let particles = [];
+      
+      const particleTex = document.createElement('canvas');
+      particleTex.width = 64;
+      particleTex.height = 64;
+      const ptCtx = particleTex.getContext('2d');
+      const pGrad = ptCtx.createRadialGradient(32, 32, 0, 32, 32, 32);
+      pGrad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+      pGrad.addColorStop(0.1, 'rgba(150, 220, 255, 0.8)');
+      pGrad.addColorStop(0.4, 'rgba(0, 100, 255, 0.2)');
+      pGrad.addColorStop(1, 'rgba(0, 0, 255, 0)');
+      ptCtx.fillStyle = pGrad;
+      ptCtx.fillRect(0, 0, 64, 64);
+
+      const state = {
+        running: false,
+        starting: false,
+        density: 1.0,
+        refraction: 1.1,
+        edge: 1.15,
+        clarity: 1.0,
+        cutoff: 0.085,
+        maskMode: 1,
+        maskModeReady: false,
+        maskBounds: [0.25, 0.08, 0.75, 0.98],
+        camera: null,
+        segmenter: null,
+        hands: null,
+        handBalls: [],
+        lastHands: [],
+        projectiles: [],
+        explosions: [],
+        lastRenderTime: 0,
+        rasenganCooldownUntil: 0,
+        flashAlpha: 0,
+          shockwaveRadius: 0,
+          cracks: [],
+          shards: []
+        };
+
+      function makeCanvas() {
+        const c = document.createElement("canvas");
+        c.width = WIDTH;
+        c.height = HEIGHT;
+        return c;
+      }
+
+      const frameCanvas = makeCanvas();
+      const frameCtx = frameCanvas.getContext("2d");
+      const rawMaskCanvas = makeCanvas();
+      const rawMaskCtx = rawMaskCanvas.getContext("2d");
+      const refinedMaskCanvas = makeCanvas();
+      const refinedMaskCtx = refinedMaskCanvas.getContext("2d");
+      const maskCanvas = makeCanvas();
+      const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
+      const codeCanvas = makeCanvas();
+      const codeCtx = codeCanvas.getContext("2d");
+      // Create 15 drops per column with independent speeds for smooth but extremely dense matrix effect
+      const drops = Array.from({ length: COLS }, () => 
+        Array.from({ length: 15 }, () => ({
+          y: Math.random() * HEIGHT,
+          speed: FONT_SIZE * (0.8 + Math.random() * 1.5)
+        }))
+      );
+
+      const gl = canvas.getContext("webgl", {
+        alpha: false,
+        antialias: false,
+        preserveDrawingBuffer: true
+      });
+
+      if (!gl) {
+        console.error("当前浏览器不支持 WebGL");
+        return;
+      }
+
+      const vertexShaderSource = `
+        attribute vec2 a_position;
+        varying vec2 v_uv;
+
+        void main() {
+          v_uv = a_position * 0.5 + 0.5;
+          gl_Position = vec4(a_position, 0.0, 1.0);
+        }
+      `;
+
+      const fragmentShaderSource = `
+        precision highp float;
+
+        uniform sampler2D u_frame;
+        uniform sampler2D u_mask;
+        uniform sampler2D u_code;
+        uniform vec2 u_resolution;
+        uniform vec4 u_maskBounds;
+        uniform float u_time;
+        uniform float u_maskMode;
+        uniform float u_refraction;
+        uniform float u_edgePower;
+        uniform float u_clarity;
+        uniform float u_maskCutoff;
+        uniform vec3 u_hands[2];
+        uniform vec3 u_projectiles[4];
+        uniform vec3 u_explosions[4];
+
+        varying vec2 v_uv;
+
+        void applyRasengan(vec3 obj, vec2 uv, float time, vec2 res, inout vec3 finalColor) {
+          if(obj.z <= 0.0) return;
+          vec2 d = uv - obj.xy;
+          d.x *= res.x / res.y;
+          float radius = obj.z * 1.6;
+          float dist = length(d);
+
+          float glow = exp(-dist * 6.0 / radius);
+          finalColor += vec3(0.0, 0.5, 1.0) * glow * 0.8;
+
+          if(dist < radius) {
+            vec2 p = d / radius;
+            float z = sqrt(max(0.0, 1.0 - dot(p, p)));
+            vec3 spherePos = vec3(p, z);
+
+            float t1 = time * 8.0;
+            float t2 = time * 12.0;
+            mat2 rotY = mat2(cos(t1), -sin(t1), sin(t1), cos(t1));
+            mat2 rotZ = mat2(cos(t2), -sin(t2), sin(t2), cos(t2));
+
+            vec3 flow1 = spherePos; flow1.xz = rotY * flow1.xz; flow1.xy = rotZ * flow1.xy;
+            vec3 flow2 = spherePos; flow2.yz = rotY * flow2.yz; flow2.xz = rotZ * flow2.xz;
+
+            float wave1 = sin(flow1.x * 12.0 + flow1.y * 6.0) * 0.5 + 0.5;
+            float wave2 = sin(flow2.y * 18.0 - flow2.z * 10.0) * 0.5 + 0.5;
+            float wave3 = sin(spherePos.z * 25.0 - time * 20.0) * 0.5 + 0.5;
+
+            float noise = fract(sin(dot(spherePos.xy * 40.0 + time, vec2(12.9898, 78.233))) * 43758.5453);
+            float energy = (wave1 * wave2 + wave3) * 0.5;
+            energy = mix(energy, noise, 0.15);
+
+            float fresnel = pow(1.0 - z, 2.5);
+            float volume = smoothstep(0.0, 0.5, z);
+            float core = smoothstep(0.85, 1.0, z) * 1.8;
+            float shell = fresnel * 1.5;
+
+            vec3 colCore = vec3(1.0, 1.0, 1.0);
+            vec3 colMid = vec3(0.1, 0.8, 1.0);
+            vec3 colEdge = vec3(0.0, 0.3, 1.0);
+
+            vec3 rasenganColor = mix(colEdge, colMid, energy * 2.0 + volume * 0.5);
+            rasenganColor = mix(rasenganColor, colCore, core + shell * 0.6 + energy * 0.8);
+
+            float edgeFade = smoothstep(1.0, 0.9, dist / radius);
+            float alpha = edgeFade * (z * 0.8 + 0.2);
+
+            finalColor = finalColor * (1.0 - alpha * 0.3) + rasenganColor * alpha * 1.4;
+          }
+        }
+
+        float rawMask(vec2 uv) {
+          vec4 m = texture2D(u_mask, clamp(uv, vec2(0.001), vec2(0.999)));
+          float val = u_maskMode > 0.5 ? m.r : m.a;
+          return smoothstep(0.40, 0.60, val); // Sharper, cleaner edge
+        }
+
+        float softMask(vec2 uv) {
+          vec2 px = 1.0 / u_resolution;
+          float m = rawMask(uv) * 0.34;
+          m += rawMask(uv + vec2(px.x * 1.7, 0.0)) * 0.10;
+          m += rawMask(uv - vec2(px.x * 1.7, 0.0)) * 0.10;
+          m += rawMask(uv + vec2(0.0, px.y * 1.7)) * 0.10;
+          m += rawMask(uv - vec2(0.0, px.y * 1.7)) * 0.10;
+          m += rawMask(uv + vec2(px.x * 2.7, px.y * 2.7)) * 0.055;
+          m += rawMask(uv + vec2(-px.x * 2.7, px.y * 2.7)) * 0.055;
+          m += rawMask(uv + vec2(px.x * 2.7, -px.y * 2.7)) * 0.055;
+          m += rawMask(uv + vec2(-px.x * 2.7, -px.y * 2.7)) * 0.055;
+          return clamp(m, 0.0, 1.0);
+        }
+
+        float hash(vec2 p) {
+          return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+        }
+
+        float ellipse(vec2 p, vec2 center, vec2 radius) {
+          vec2 q = (p - center) / radius;
+          return 1.0 - smoothstep(0.72, 1.0, dot(q, q));
+        }
+
+        float ringEllipse(vec2 p, vec2 center, vec2 radius, float width) {
+          vec2 q = (p - center) / radius;
+          float d = sqrt(dot(q, q));
+          float outer = 1.0 - smoothstep(1.0, 1.0 + width, d);
+          float inner = smoothstep(1.0 - width, 1.0, d);
+          return outer * inner;
+        }
+
+        float bubbleField(vec2 local, float maskCore) {
+          vec2 p = local * vec2(7.0, 10.5);
+          vec2 id = floor(p);
+          vec2 f = fract(p);
+          float rnd = hash(id);
+          vec2 center = vec2(hash(id + 11.1), hash(id + 23.7)) * 0.56 + 0.22;
+          float radius = mix(0.060, 0.150, hash(id + 41.3));
+          float d = length((f - center) * vec2(1.0, 1.18));
+          float ring = (1.0 - smoothstep(radius, radius + 0.030, d)) * smoothstep(radius - 0.030, radius, d);
+          float dotHi = 1.0 - smoothstep(0.0, radius * 0.30, length((f - center - vec2(-0.030, -0.038)) * vec2(1.0, 1.18)));
+          return step(0.76, rnd) * (ring * 0.62 + dotHi * 0.25) * maskCore;
+        }
+
+        float outsideWeight(vec2 uv) {
+          return 1.0 - smoothstep(u_maskCutoff, u_maskCutoff + 0.22, rawMask(uv));
+        }
+
+        vec3 backgroundProxy(vec2 uv, vec2 local, vec2 liquidNormal) {
+          vec2 center = (u_maskBounds.xy + u_maskBounds.zw) * 0.5;
+          vec2 fromCenter = uv - center;
+          fromCenter.x *= u_resolution.x / u_resolution.y;
+          vec2 outward = normalize(fromCenter + liquidNormal * 0.18 + vec2(0.0001, 0.0001));
+          outward.x /= u_resolution.x / u_resolution.y;
+          outward = normalize(outward + vec2(0.0001, 0.0001));
+          vec2 tangent = vec2(-outward.y, outward.x);
+
+          vec3 acc = vec3(0.0);
+          float total = 0.0;
+          vec2 p;
+          float w;
+
+          p = clamp(uv + outward * 0.08, vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.52;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + outward * 0.15, vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.72;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + outward * 0.24, vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.82;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + outward * 0.17 + tangent * 0.075, vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.52;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + outward * 0.17 - tangent * 0.075, vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.52;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + vec2(0.16, 0.00), vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.34;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + vec2(-0.16, 0.00), vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.34;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + vec2(0.00, 0.14), vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.30;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          p = clamp(uv + vec2(0.00, -0.14), vec2(0.001), vec2(0.999));
+          w = outsideWeight(p) * 0.30;
+          acc += texture2D(u_frame, p).rgb * w;
+          total += w;
+
+          vec3 edgeEnv =
+            texture2D(u_frame, vec2(0.04, clamp(uv.y, 0.04, 0.96))).rgb * (1.0 - local.x) +
+            texture2D(u_frame, vec2(0.96, clamp(uv.y, 0.04, 0.96))).rgb * local.x;
+          vec3 verticalEnv =
+            texture2D(u_frame, vec2(clamp(uv.x, 0.04, 0.96), 0.04)).rgb * (1.0 - local.y) +
+            texture2D(u_frame, vec2(clamp(uv.x, 0.04, 0.96), 0.96)).rgb * local.y;
+          vec3 env = mix(edgeEnv, verticalEnv, 0.34);
+          return total > 0.001 ? mix(env, acc / total, 0.74) : env;
+        }
+
+        void main() {
+          vec2 uv = v_uv;
+          vec3 original = texture2D(u_frame, uv).rgb;
+          float raw = rawMask(uv);
+          float softRaw = softMask(uv);
+
+          // Check if this pixel is near any independent hand sphere, projectile, or explosion
+          bool nearHand = false;
+          for(int i = 0; i < 2; i++) {
+            if(u_hands[i].z > 0.0 && length((uv - u_hands[i].xy) * vec2(u_resolution.x / u_resolution.y, 1.0)) < u_hands[i].z * 2.0) nearHand = true;
+          }
+          for(int i = 0; i < 4; i++) {
+            if(u_projectiles[i].z > 0.0 && length((uv - u_projectiles[i].xy) * vec2(u_resolution.x / u_resolution.y, 1.0)) < u_projectiles[i].z * 2.0) nearHand = true;
+          }
+          for(int i = 0; i < 4; i++) {
+            if(u_explosions[i].z > 0.0 && u_explosions[i].z < 1.0 && length((uv - u_explosions[i].xy) * vec2(u_resolution.x / u_resolution.y, 1.0)) < u_explosions[i].z * 1.5) nearHand = true;
+          }
+
+          // ONLY skip rendering if it's outside the body mask AND not near a hand
+          if (raw < u_maskCutoff && !nearHand) {
+            gl_FragColor = vec4(original, 1.0);
+            return;
+          }
+
+          float person = smoothstep(u_maskCutoff, u_maskCutoff + 0.56, softRaw);
+          float core = smoothstep(u_maskCutoff + 0.18, 0.92, softRaw);
+          vec2 px = 1.0 / u_resolution;
+
+          float ml = softMask(uv - vec2(px.x * 3.0, 0.0));
+          float mr = softMask(uv + vec2(px.x * 3.0, 0.0));
+          float md = softMask(uv - vec2(0.0, px.y * 3.0));
+          float mu = softMask(uv + vec2(0.0, px.y * 3.0));
+          vec2 grad = vec2(mr - ml, mu - md);
+          float gradLen = length(grad);
+          vec2 normal = normalize(grad + vec2(0.0001));
+
+          float edge = smoothstep(0.020, 0.14, gradLen) * person;
+          vec2 boundsSize = max(u_maskBounds.zw - u_maskBounds.xy, vec2(0.001));
+          vec2 local = clamp((uv - u_maskBounds.xy) / boundsSize, vec2(0.0), vec2(1.0));
+
+          float waveA = sin(uv.y * 88.0 + u_time * 2.3);
+          float waveB = sin((uv.x + uv.y) * 52.0 - u_time * 1.8);
+          float waveC = sin(uv.x * 116.0 + u_time * 2.7);
+          // Significantly reduced wave distortion to remove the "ugly bubbles" look in the center
+          vec2 liquidNormal = normalize(normal + vec2(waveA, waveB) * 0.03 + vec2(waveC, waveA) * 0.015);
+
+          // Removed the giant radial bubble shape. Thickness is now purely based on the mask core.
+          float thickness = core; 
+          float edgeShade = (1.0 - core) * person * 0.5;
+          float darkRim = edge * 0.3;
+          float rim = edge * 0.80 * u_edgePower;
+          vec3 proxyBg = backgroundProxy(uv, local, liquidNormal);
+          vec2 bodyRefract = liquidNormal * (0.012 + thickness * 0.034 + rim * 0.020) * u_refraction;
+          vec2 uvA = clamp(uv + bodyRefract, vec2(0.001), vec2(0.999));
+          vec2 uvB = clamp(uv - bodyRefract * 0.58, vec2(0.001), vec2(0.999));
+          vec2 uvC = clamp(uv + vec2(-bodyRefract.y, bodyRefract.x) * 0.42, vec2(0.001), vec2(0.999));
+          vec3 bendA = backgroundProxy(uvA, clamp((uvA - u_maskBounds.xy) / boundsSize, vec2(0.0), vec2(1.0)), liquidNormal);
+          vec3 bendB = backgroundProxy(uvB, clamp((uvB - u_maskBounds.xy) / boundsSize, vec2(0.0), vec2(1.0)), liquidNormal);
+          vec3 bendC = backgroundProxy(uvC, clamp((uvC - u_maskBounds.xy) / boundsSize, vec2(0.0), vec2(1.0)), liquidNormal);
+          vec3 refracted = proxyBg * 0.30 + bendA * 0.42 + bendB * 0.18 + bendC * 0.10;
+
+          float bubble = 0.0; // Removed the ugly bubbles completely
+          vec3 glass = refracted * (0.96 + 0.03 * u_clarity);
+          glass += vec3(1.00, 1.00, 0.98) * thickness * 0.020;
+          glass *= 1.0 - darkRim * 0.22;
+          glass -= vec3(0.020) * edgeShade * (1.0 - thickness);
+
+          vec2 codeUv = uv + liquidNormal * (0.018 + rim * 0.015) * u_refraction;
+          codeUv.x += sin(uv.y * 72.0 + u_time * 2.0) * 0.004;
+          codeUv.y += sin(uv.x * 48.0 - u_time * 1.55) * 0.004;
+          vec3 code = texture2D(u_code, codeUv).rgb;
+          vec3 codeBlur = texture2D(u_code, codeUv + liquidNormal * 0.010).rgb;
+          float codeL = max(max(code.r, code.g), code.b);
+          float codeGhost = max(max(codeBlur.r, codeBlur.g), codeBlur.b);
+          codeL = max(codeL, codeGhost * 0.36);
+          codeL = smoothstep(0.055, 0.42, codeL);
+          float codeGate = smoothstep(u_maskCutoff + 0.30, 0.84, softRaw);
+          float codeDepth = codeGate * thickness * 0.96;
+          float codeInk = codeL * codeDepth * (1.0 - rim * 0.52);
+          glass *= 1.0 - codeInk * 0.24;
+          vec3 codeColor =
+            vec3(0.00, 1.00, 0.20) * codeInk * 0.70 +
+            vec3(0.50, 1.00, 0.50) * pow(codeInk, 2.0) * 0.40;
+
+          float caustic =
+            sin((uv.x + uv.y) * 74.0 + u_time * 2.35) *
+            sin(uv.y * 92.0 - u_time * 1.65);
+          caustic = smoothstep(0.40, 0.94, caustic) * thickness * 0.066;
+
+          vec3 water = glass;
+          water += codeColor;
+          // Removed the artificial highlights to keep the center clean
+          water += vec3(1.00, 1.00, 1.00) * rim * 0.46;
+          water += vec3(0.96, 1.00, 0.98) * caustic * 0.20;
+          water += vec3(hash(floor(uv * u_resolution * 0.60) + u_time) * 0.004) * thickness;
+          water = clamp(water, 0.0, 1.0);
+
+          float erase = smoothstep(u_maskCutoff + 0.010, u_maskCutoff + 0.14, raw);
+          vec3 baseColor = mix(original, proxyBg, erase);
+          float waterAlpha = smoothstep(u_maskCutoff + 0.010, u_maskCutoff + 0.48, softRaw) *
+            smoothstep(u_maskCutoff, u_maskCutoff + 0.14, raw);
+          vec3 finalColor = mix(baseColor, water, waterAlpha);
+          
+          // Render Rasengan for hands and projectiles
+          for(int i = 0; i < 2; i++) {
+            applyRasengan(u_hands[i], uv, u_time, u_resolution, finalColor);
+          }
+          for(int i = 0; i < 4; i++) {
+            applyRasengan(u_projectiles[i], uv, u_time, u_resolution, finalColor);
+          }
+
+          gl_FragColor = vec4(finalColor, 1.0);
+        }
+      `;
+
+      function compileShader(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          const info = gl.getShaderInfoLog(shader);
+          gl.deleteShader(shader);
+          throw new Error(info || "Shader compile failed");
+        }
+
+        return shader;
+      }
+
+      function createProgram(vsSource, fsSource) {
+        const vs = compileShader(gl.VERTEX_SHADER, vsSource);
+        const fs = compileShader(gl.FRAGMENT_SHADER, fsSource);
+        const program = gl.createProgram();
+        gl.attachShader(program, vs);
+        gl.attachShader(program, fs);
+        gl.linkProgram(program);
+
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+          const info = gl.getProgramInfoLog(program);
+          throw new Error(info || "Program link failed");
+        }
+
+        return program;
+      }
+
+      const program = createProgram(vertexShaderSource, fragmentShaderSource);
+      gl.useProgram(program);
+
+      const positionBuffer = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+      gl.bufferData(
+        gl.ARRAY_BUFFER,
+        new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]),
+        gl.STATIC_DRAW
+      );
+
+      const positionLoc = gl.getAttribLocation(program, "a_position");
+      gl.enableVertexAttribArray(positionLoc);
+      gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+
+      const uniforms = {
+          frame: gl.getUniformLocation(program, "u_frame"),
+          mask: gl.getUniformLocation(program, "u_mask"),
+          code: gl.getUniformLocation(program, "u_code"),
+          resolution: gl.getUniformLocation(program, "u_resolution"),
+          maskBounds: gl.getUniformLocation(program, "u_maskBounds"),
+          time: gl.getUniformLocation(program, "u_time"),
+          maskMode: gl.getUniformLocation(program, "u_maskMode"),
+          refraction: gl.getUniformLocation(program, "u_refraction"),
+          edgePower: gl.getUniformLocation(program, "u_edgePower"),
+          clarity: gl.getUniformLocation(program, "u_clarity"),
+          maskCutoff: gl.getUniformLocation(program, "u_maskCutoff"),
+          hands: [
+            gl.getUniformLocation(program, "u_hands[0]"),
+            gl.getUniformLocation(program, "u_hands[1]")
+          ],
+          projectiles: [
+            gl.getUniformLocation(program, "u_projectiles[0]"),
+            gl.getUniformLocation(program, "u_projectiles[1]"),
+            gl.getUniformLocation(program, "u_projectiles[2]"),
+            gl.getUniformLocation(program, "u_projectiles[3]")
+          ],
+          explosions: [
+            gl.getUniformLocation(program, "u_explosions[0]"),
+            gl.getUniformLocation(program, "u_explosions[1]"),
+            gl.getUniformLocation(program, "u_explosions[2]"),
+            gl.getUniformLocation(program, "u_explosions[3]")
+          ]
+        };
+
+      function makeTexture(unit) {
+        const texture = gl.createTexture();
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, WIDTH, HEIGHT, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        return texture;
+      }
+
+      const frameTexture = makeTexture(0);
+      const maskTexture = makeTexture(1);
+      const codeTexture = makeTexture(2);
+
+      gl.uniform1i(uniforms.frame, 0);
+      gl.uniform1i(uniforms.mask, 1);
+      gl.uniform1i(uniforms.code, 2);
+      gl.uniform2f(uniforms.resolution, WIDTH, HEIGHT);
+      gl.viewport(0, 0, WIDTH, HEIGHT);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+
+      function uploadTexture(texture, unit, source) {
+        gl.activeTexture(gl.TEXTURE0 + unit);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+      }
+
+      function mirrorDraw(targetCtx, image) {
+        targetCtx.save();
+        targetCtx.translate(WIDTH, 0);
+        targetCtx.scale(-1, 1);
+        targetCtx.drawImage(image, 0, 0, WIDTH, HEIGHT);
+        targetCtx.restore();
+      }
+
+      function updateFrameTexture(image) {
+        frameCtx.clearRect(0, 0, WIDTH, HEIGHT);
+        mirrorDraw(frameCtx, image);
+        uploadTexture(frameTexture, 0, frameCanvas);
+      }
+
+      function updateMaskTexture(segmentationMask) {
+        rawMaskCtx.clearRect(0, 0, WIDTH, HEIGHT);
+        mirrorDraw(rawMaskCtx, segmentationMask);
+
+        // Hand balls are now rendered directly in the WebGL shader for a true 3D effect
+
+        // Fix: Clear the mask canvas every frame to prevent permanent ghosting/accumulation
+        maskCtx.clearRect(0, 0, WIDTH, HEIGHT);
+        maskCtx.drawImage(rawMaskCanvas, 0, 0);
+        
+        analyzeMask();
+        uploadTexture(maskTexture, 1, maskCanvas);
+      }
+
+      function analyzeMask() {
+        const data = maskCtx.getImageData(0, 0, WIDTH, HEIGHT).data;
+        let minR = 255;
+        let maxR = 0;
+        let minA = 255;
+        let maxA = 0;
+        let minX = WIDTH;
+        let minY = HEIGHT;
+        let maxX = 0;
+        let maxY = 0;
+        const boundThreshold = Math.max(48, Math.round(state.cutoff * 255));
+
+        for (let y = 0; y < HEIGHT; y += MASK_SCAN_STEP) {
+          for (let x = 0; x < WIDTH; x += MASK_SCAN_STEP) {
+            const i = (y * WIDTH + x) * 4;
+            const r = data[i];
+            const a = data[i + 3];
+            minR = Math.min(minR, r);
+            maxR = Math.max(maxR, r);
+            minA = Math.min(minA, a);
+            maxA = Math.max(maxA, a);
+
+            const maskValue = state.maskMode > 0.5 ? r : a;
+            if (maskValue > boundThreshold) {
+              minX = Math.min(minX, x);
+              minY = Math.min(minY, y);
+              maxX = Math.max(maxX, x);
+              maxY = Math.max(maxY, y);
+            }
+          }
+        }
+
+        if (!state.maskModeReady) {
+          const rRange = maxR - minR;
+          const aRange = maxA - minA;
+
+          if (rRange > 32 || aRange > 32) {
+            state.maskMode = rRange >= aRange ? 1 : 0;
+            state.maskModeReady = true;
+          }
+        }
+
+        if (minX < maxX && minY < maxY) {
+          const padX = 34;
+          const padY = 40;
+          const next = [
+            Math.max(0, minX - padX) / WIDTH,
+            Math.max(0, minY - padY) / HEIGHT,
+            Math.min(WIDTH, maxX + padX) / WIDTH,
+            Math.min(HEIGHT, maxY + padY) / HEIGHT
+          ];
+
+          for (let i = 0; i < 4; i++) {
+            state.maskBounds[i] = state.maskBounds[i] * 0.58 + next[i] * 0.42;
+          }
+        }
+      }
+
+      function drawCodeRain() {
+        // Slightly lower alpha for longer, smoother trails
+        codeCtx.fillStyle = "rgba(0, 0, 0, 0.12)";
+        codeCtx.fillRect(0, 0, WIDTH, HEIGHT);
+        codeCtx.font = `bold ${FONT_SIZE}px "Courier New", Courier, monospace`;
+        codeCtx.textBaseline = "top";
+
+        for (let i = 0; i < COLS; i++) {
+          for (let k = 0; k < drops[i].length; k++) {
+            const drop = drops[i][k];
+            const x = i * FONT_SIZE;
+            const y = drop.y;
+            const ch = CHARS[Math.floor(Math.random() * CHARS.length)];
+            
+            // Randomly highlight the leading characters
+            if (Math.random() > 0.88) {
+              codeCtx.fillStyle = "#ffffff"; // White core
+            } else if (Math.random() > 0.5) {
+              codeCtx.fillStyle = "#00ff33"; // Bright Green
+            } else {
+              codeCtx.fillStyle = "#009900"; // Deep Green
+            }
+
+            codeCtx.lineWidth = 2;
+            codeCtx.strokeStyle = "#000000";
+            codeCtx.lineJoin = "round";
+            codeCtx.strokeText(ch, x, y);
+            codeCtx.fillText(ch, x, y);
+            
+            // Move down by its individual speed
+            drop.y += drop.speed;
+
+            // Reset to top with a new random speed when it goes off screen
+            if (drop.y > HEIGHT && Math.random() > 0.75) {
+              drop.y = 0;
+              drop.speed = FONT_SIZE * (0.8 + Math.random() * 1.5);
+            }
+          }
+        }
+      }
+
+      function spawnParticles(x, y) {
+        const count = 5000;
+        for (let i = 0; i < count; i++) {
+          const angle = Math.random() * Math.PI * 2;
+          const speed = Math.pow(Math.random(), 3) * 2500 + 100; // Restored massive spread
+          
+          particles.push({
+            x: x,
+            y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            life: 1.0,
+            decay: Math.random() * 0.08 + 0.04,
+            size: Math.random() * 160 + 20 // Restored massive particle size
+          });
+        }
+        
+        // Generate Realistic Glass Screen Cracks (Spider-web style)
+        state.cracks = [];
+        const numMainCracks = 8 + Math.floor(Math.random() * 6);
+        for (let i = 0; i < numMainCracks; i++) {
+          let cx = x;
+          let cy = y;
+          let angle = (i / numMainCracks) * Math.PI * 2 + (Math.random() - 0.5) * 0.5;
+          const segments = [];
+          
+          let numSteps = 8 + Math.floor(Math.random() * 12);
+          let currentThick = 5.0 + Math.random() * 2.0;
+          
+          for (let j = 0; j < numSteps; j++) {
+            const len = 40 + Math.random() * 90;
+            angle += (Math.random() - 0.5) * 0.6; // Jagged path
+            const nx = cx + Math.cos(angle) * len;
+            const ny = cy + Math.sin(angle) * len;
+            segments.push({ x1: cx, y1: cy, x2: nx, y2: ny, t: currentThick });
+            
+            // Generate side spider-web branches
+            if (Math.random() > 0.35) {
+                let sideAngle = angle + (Math.random() > 0.5 ? 1 : -1) * (1.0 + Math.random() * 0.8);
+                let scx = nx;
+                let scy = ny;
+                let sideSteps = 1 + Math.floor(Math.random() * 3);
+                let sThick = currentThick * 0.6;
+                for(let k = 0; k < sideSteps; k++) {
+                    let slen = 25 + Math.random() * 60;
+                    sideAngle += (Math.random() - 0.5) * 0.5;
+                    let snx = scx + Math.cos(sideAngle) * slen;
+                    let sny = scy + Math.sin(sideAngle) * slen;
+                    segments.push({ x1: scx, y1: scy, x2: snx, y2: sny, t: sThick });
+                    scx = snx;
+                    scy = sny;
+                    sThick *= 0.7;
+                }
+            }
+            
+            cx = nx;
+            cy = ny;
+            currentThick *= 0.75; // Taper off thickness towards edges
+          }
+          
+          state.cracks.push({
+            segments: segments,
+            life: 1.0 + Math.random() * 0.4
+          });
+        }
+
+        // Generate flying glass shards for true shatter effect
+        state.shards = [];
+        const numShards = 40 + Math.floor(Math.random() * 30);
+        for (let i = 0; i < numShards; i++) {
+          const angle = Math.random() * Math.PI * 2;
+          const speed = Math.random() * 35 + 15; // Explosive outward burst
+          const size = Math.random() * 50 + 10;
+          const vertices = [];
+          const numVerts = 3 + Math.floor(Math.random() * 2); // Triangles and sharp quads
+          for(let v = 0; v < numVerts; v++) {
+            const vAngle = (v / numVerts) * Math.PI * 2 + (Math.random() - 0.5);
+            const r = size * (0.4 + Math.random() * 0.6);
+            vertices.push({x: Math.cos(vAngle) * r, y: Math.sin(vAngle) * r});
+          }
+          state.shards.push({
+            x: x, y: y,
+            vx: Math.cos(angle) * speed,
+            vy: Math.sin(angle) * speed,
+            rot: Math.random() * Math.PI * 2,
+            vRot: (Math.random() - 0.5) * 0.6, // Fast spinning
+            vertices: vertices,
+            life: 1.2,
+            decay: 0.015 + Math.random() * 0.01
+          });
+        }
+        
+        // Add CSS screen shake
+        document.body.classList.add("shake-active");
+        setTimeout(() => document.body.classList.remove("shake-active"), 400);
+      }
+
+      function updateAndDrawParticles() {
+        pCtx.clearRect(0, 0, WIDTH, HEIGHT);
+        pCtx.globalCompositeOperation = "screen";
+
+        for (let i = particles.length - 1; i >= 0; i--) {
+          let p = particles[i];
+          
+          p.x += p.vx;
+          p.y += p.vy;
+          p.vx *= 0.94; // Less friction, flies much further to cover screen
+          p.vy *= 0.94;
+          p.life -= p.decay;
+
+          if (p.life <= 0) {
+            particles.splice(i, 1);
+            continue;
+          }
+
+          pCtx.globalAlpha = p.life * 0.8; // Prevent pure whiteout with massive density
+          const s = p.size * p.life;
+          pCtx.drawImage(particleTex, p.x - s/2, p.y - s/2, s, s);
+        }
+        pCtx.globalAlpha = 1.0;
+        pCtx.globalCompositeOperation = "source-over";
+
+        // Draw Realistic Glass Cracks
+        if (state.cracks && state.cracks.length > 0) {
+          pCtx.save();
+          pCtx.lineCap = "round";
+          pCtx.lineJoin = "miter";
+          
+          for (let i = state.cracks.length - 1; i >= 0; i--) {
+            let crack = state.cracks[i];
+            crack.life -= 0.06; // Faster fade so it doesn't linger too long
+            if (crack.life <= 0) {
+              state.cracks.splice(i, 1);
+              continue;
+            }
+            
+            let alpha = Math.min(1.0, crack.life * 1.5);
+            
+            for (let seg of crack.segments) {
+              // 1. Dark refractive edge (creates 3D glass depth)
+              pCtx.beginPath();
+              pCtx.moveTo(seg.x1 + 2, seg.y1 + 2);
+              pCtx.lineTo(seg.x2 + 2, seg.y2 + 2);
+              pCtx.strokeStyle = `rgba(0, 0, 0, ${alpha * 0.85})`;
+              pCtx.lineWidth = seg.t;
+              pCtx.stroke();
+
+              // 2. Cyan energy glow bleed
+              pCtx.beginPath();
+              pCtx.moveTo(seg.x1, seg.y1);
+              pCtx.lineTo(seg.x2, seg.y2);
+              pCtx.strokeStyle = `rgba(100, 220, 255, ${alpha * 0.6})`;
+              pCtx.lineWidth = seg.t * 3.0;
+              pCtx.stroke();
+              
+              // 3. Sharp bright white core
+              pCtx.beginPath();
+              pCtx.moveTo(seg.x1, seg.y1);
+              pCtx.lineTo(seg.x2, seg.y2);
+              pCtx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
+              pCtx.lineWidth = seg.t * 0.6;
+              pCtx.stroke();
+            }
+          }
+          pCtx.restore();
+        }
+
+        // Draw Flying Glass Shards
+        if (state.shards && state.shards.length > 0) {
+          pCtx.save();
+          for (let i = state.shards.length - 1; i >= 0; i--) {
+            let s = state.shards[i];
+            s.x += s.vx;
+            s.y += s.vy;
+            s.vy += 1.2; // Gravity pulls shards down
+            s.vx *= 0.98; // Air resistance
+            s.rot += s.vRot;
+            s.life -= s.decay;
+
+            if (s.life <= 0) {
+              state.shards.splice(i, 1);
+              continue;
+            }
+
+            pCtx.translate(s.x, s.y);
+            pCtx.rotate(s.rot);
+            
+            pCtx.beginPath();
+            pCtx.moveTo(s.vertices[0].x, s.vertices[0].y);
+            for(let v = 1; v < s.vertices.length; v++) {
+              pCtx.lineTo(s.vertices[v].x, s.vertices[v].y);
+            }
+            pCtx.closePath();
+
+            // Glass shard styling
+            const alpha = Math.min(1.0, s.life);
+            pCtx.fillStyle = `rgba(180, 230, 255, ${alpha * 0.4})`;
+            pCtx.fill();
+            pCtx.strokeStyle = `rgba(255, 255, 255, ${alpha * 0.9})`;
+            pCtx.lineWidth = 2;
+            pCtx.stroke();
+            
+            // Add a thick edge highlight for 3D glass thickness effect
+            pCtx.beginPath();
+            pCtx.moveTo(s.vertices[0].x, s.vertices[0].y);
+            pCtx.lineTo(s.vertices[1].x, s.vertices[1].y);
+            pCtx.strokeStyle = `rgba(100, 200, 255, ${alpha})`;
+            pCtx.lineWidth = 4;
+            pCtx.stroke();
+
+            pCtx.rotate(-s.rot);
+            pCtx.translate(-s.x, -s.y);
+          }
+          pCtx.restore();
+        }
+      }
+
+      function render() {
+        const now = performance.now();
+        if (!state.lastRenderTime) state.lastRenderTime = now;
+        const dt = (now - state.lastRenderTime) / 1000.0;
+        state.lastRenderTime = now;
+
+        // Update Projectiles (flying Rasengans)
+        for (let i = state.projectiles.length - 1; i >= 0; i--) {
+          let p = state.projectiles[i];
+          
+          // Force flight path towards the absolute center of the screen
+          let dx = 0.5 - p.x;
+          let dy = 0.5 - p.y;
+          let dist = Math.hypot(dx, dy);
+          
+          // Make the flight visually trackable (slower) but accelerating
+          p.life = (p.life || 0) + dt;
+          let speed = dt * (1.0 + p.life * 2.0); 
+          
+          if (dist <= speed || p.life > 1.2) {
+            // Explode exactly at center
+            if (state.explosions.length < 4) {
+              state.explosions.push({ x: 0.5, y: 0.5, t: 0.0 });
+              spawnParticles(WIDTH * 0.5, HEIGHT * 0.5);
+            }
+            state.projectiles.splice(i, 1);
+            // Start the strict 3-second cooldown AFTER the explosion triggers
+            state.rasenganCooldownUntil = now + 3000;
+          } else {
+            p.x += (dx / dist) * speed;
+            p.y += (dy / dist) * speed;
+          }
+        }
+
+        // Update Explosions
+        for (let i = state.explosions.length - 1; i >= 0; i--) {
+          let e = state.explosions[i];
+          e.t += dt * 0.8; // Adjust explosion timeline
+          if (e.t > 2.5) {
+            state.explosions.splice(i, 1);
+          }
+        }
+
+        updateAndDrawParticles();
+
+        gl.useProgram(program);
+        gl.uniform1f(uniforms.time, now * 0.001);
+        gl.uniform1f(uniforms.maskMode, state.maskMode);
+        gl.uniform4f(
+          uniforms.maskBounds,
+          state.maskBounds[0],
+          state.maskBounds[1],
+          state.maskBounds[2],
+          state.maskBounds[3]
+        );
+        gl.uniform1f(uniforms.refraction, state.refraction);
+        gl.uniform1f(uniforms.edgePower, state.edge);
+        gl.uniform1f(uniforms.clarity, state.clarity);
+        gl.uniform1f(uniforms.maskCutoff, state.cutoff);
+        
+        // Only show Rasengan in hand if the cooldown has expired
+        const canShowRasengan = now > (state.rasenganCooldownUntil || 0);
+        for (let i = 0; i < 2; i++) {
+          if (canShowRasengan && state.handBalls && i < state.handBalls.length) {
+            gl.uniform3f(uniforms.hands[i], state.handBalls[i].x, state.handBalls[i].y, state.handBalls[i].r);
+          } else {
+            gl.uniform3f(uniforms.hands[i], 0.0, 0.0, 0.0);
+          }
+        }
+
+        for (let i = 0; i < 4; i++) {
+          if (i < state.projectiles.length) {
+            let p = state.projectiles[i];
+            gl.uniform3f(uniforms.projectiles[i], p.x, p.y, p.r);
+          } else {
+            gl.uniform3f(uniforms.projectiles[i], 0.0, 0.0, 0.0);
+          }
+        }
+
+        for (let i = 0; i < 4; i++) {
+          if (i < state.explosions.length) {
+            let e = state.explosions[i];
+            gl.uniform3f(uniforms.explosions[i], e.x, e.y, e.t);
+          } else {
+            gl.uniform3f(uniforms.explosions[i], 0.0, 0.0, 0.0);
+          }
+        }
+        
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+
+      function onResults(results) {
+        updateFrameTexture(results.image);
+        updateMaskTexture(results.segmentationMask);
+        drawCodeRain();
+        uploadTexture(codeTexture, 2, codeCanvas);
+        render();
+      }
+
+      async function startCamera() {
+        if (state.running || state.starting) {
+          return;
+        }
+
+        state.starting = true;
+
+        try {
+          if (!window.SelfieSegmentation || !window.Camera || !window.Hands) {
+            throw new Error("MediaPipe scripts not fully loaded yet");
+          }
+
+          const segmenter = new SelfieSegmentation({
+            locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`
+          });
+          segmenter.setOptions({ modelSelection: 0, selfieMode: false });
+          segmenter.onResults(onResults);
+
+          const hands = new Hands({
+            locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+          });
+          hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+          });
+          hands.onResults((results) => {
+            const currentHands = [];
+            if (results.multiHandLandmarks) {
+              for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                const marks = results.multiHandLandmarks[i];
+                const tips = [marks[4], marks[8], marks[12], marks[16], marks[20]];
+                const cx = marks[9].x;
+                const cy = marks[9].y;
+                
+                let maxDist = 0;
+                for (let j = 0; j < 5; j++) {
+                  const dx = tips[j].x - cx;
+                  const dy = tips[j].y - cy;
+                  maxDist = Math.max(maxDist, Math.sqrt(dx * dx + dy * dy));
+                }
+                
+                currentHands.push({
+                  x: 1.0 - cx,
+                  y: 1.0 - cy,
+                  r: Math.max(maxDist * 1.2, 0.05)
+                });
+              }
+            }
+
+            // Track hand velocity to trigger throwing
+            for (let i = 0; i < currentHands.length; i++) {
+              const curr = currentHands[i];
+              let matchedLast = null;
+              let minDist = 999;
+
+              for (let j = 0; j < state.lastHands.length; j++) {
+                const last = state.lastHands[j];
+                const d = Math.hypot(curr.x - last.x, curr.y - last.y);
+                if (d < minDist) {
+                  minDist = d;
+                  matchedLast = last;
+                }
+              }
+
+              if (matchedLast) {
+                const vx = curr.x - matchedLast.x;
+                const vy = curr.y - matchedLast.y;
+                const speed = Math.hypot(vx, vy);
+
+                curr.cooldown = (matchedLast.cooldown || 0) - 1;
+
+                // If hand moves fast enough, throw a projectile
+                const nowTime = performance.now();
+                if (speed > 0.06 && state.projectiles.length === 0 && nowTime > (state.rasenganCooldownUntil || 0)) {
+                  state.projectiles.push({
+                    x: curr.x,
+                    y: curr.y,
+                    r: curr.r,
+                    life: 0
+                  });
+                  // Set cooldown to a massive number while flying to ensure ball leaves hand completely
+                  state.rasenganCooldownUntil = nowTime + 999999; 
+                }
+              } else {
+                curr.cooldown = 0;
+              }
+            }
+
+            state.lastHands = currentHands;
+            state.handBalls = currentHands;
+          });
+
+          const camera = new Camera(video, {
+            onFrame: async () => {
+              // Run hands first to update coordinates, then segmenter to trigger render
+              await hands.send({ image: video });
+              await segmenter.send({ image: video });
+            },
+            width: WIDTH,
+            height: HEIGHT
+          });
+
+          state.segmenter = segmenter;
+          state.hands = hands;
+          state.camera = camera;
+          await camera.start();
+
+          state.running = true;
+          state.starting = false;
+        } catch (err) {
+          console.error(err);
+          stopCamera();
+        }
+      }
+
+      function stopCamera() {
+        if (state.camera && typeof state.camera.stop === "function") {
+          state.camera.stop();
+        }
+
+        if (video.srcObject) {
+          video.srcObject.getTracks().forEach(track => track.stop());
+          video.srcObject = null;
+        }
+
+        if (state.segmenter && typeof state.segmenter.close === "function") {
+          state.segmenter.close();
+        }
+        
+        if (state.hands && typeof state.hands.close === "function") {
+          state.hands.close();
+        }
+
+        state.camera = null;
+        state.segmenter = null;
+        state.hands = null;
+        state.handBalls = [];
+        state.lastHands = [];
+        state.projectiles = [];
+        state.explosions = [];
+        state.running = false;
+        state.starting = false;
+        state.maskMode = 1;
+        state.maskModeReady = false;
+        state.maskBounds = [0.25, 0.08, 0.75, 0.98];
+      }
+      drawCodeRain();
+      uploadTexture(codeTexture, 2, codeCanvas);
+      frameCtx.fillStyle = "#101818";
+      frameCtx.fillRect(0, 0, WIDTH, HEIGHT);
+      uploadTexture(frameTexture, 0, frameCanvas);
+      maskCtx.clearRect(0, 0, WIDTH, HEIGHT);
+      uploadTexture(maskTexture, 1, maskCanvas);
+      render();
+
+      window.addEventListener("load", startCamera, { once: true });
+
+      window.addEventListener("beforeunload", stopCamera);
+    })();
+  </script>
+</body>
+</html>
