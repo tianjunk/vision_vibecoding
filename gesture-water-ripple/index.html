@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Hand Tracking Water Ripples</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- MediaPipe Hands -->
     <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/hands.js" crossorigin="anonymous"></script>
     <style>
         * {
@@ -99,8 +98,7 @@
 
         const canvas = document.getElementById('output');
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        
-        // Offscreen canvas for getting video pixels
+
         const offCanvas = document.createElement('canvas');
         const offCtx = offCanvas.getContext('2d', { willReadFrequently: true });
 
@@ -108,34 +106,63 @@
         const errorEl = document.getElementById('error-msg');
         const errorText = document.getElementById('error-text');
 
-        // Internal resolution for processing (balance between quality and performance)
-        const W = 640;
-        const H = 480;
+        // ── Resolution ──────────────────────────────────────────────────
+        // Physics at ¼ resolution for 4x faster wave simulation
+        const W  = 640;
+        const H  = 480;
+        const PW = 320;  // physics width
+        const PH = 240;  // physics height
+        const scaleX = W / PW;   // 2.0
+        const scaleY = H / PH;   // 2.0
+
         canvas.width = W;
         canvas.height = H;
         offCanvas.width = W;
         offCanvas.height = H;
 
-        // Water Ripple Buffers
-        const size = W * H;
-        let buf1 = new Float32Array(size);
-        let buf2 = new Float32Array(size);
-        const damping = 0.99; // Increased for longer lasting fluid flow
+        // ── Ripple buffers (physics resolution) ─────────────────────────
+        const pSize = PW * PH;
+        let buf1 = new Float32Array(pSize);
+        let buf2 = new Float32Array(pSize);
+        const DAMPING = 0.985;
+        const EDGE = 2; // skip border pixels
 
+        // ── Precomputed drop kernel ──────────────────────────────────────
+        const MAX_RADIUS = 9; // physics-space radius (was 16 at 640 → 8 at 320)
+        const kernelW = MAX_RADIUS * 2 + 1;
+        const dropKernel = new Float32Array(kernelW * kernelW);
+        for (let dy = -MAX_RADIUS; dy <= MAX_RADIUS; dy++) {
+            for (let dx = -MAX_RADIUS; dx <= MAX_RADIUS; dx++) {
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist <= MAX_RADIUS) {
+                    dropKernel[(dy + MAX_RADIUS) * kernelW + (dx + MAX_RADIUS)] =
+                        (Math.cos((dist / MAX_RADIUS) * Math.PI) + 1) * 0.5;
+                }
+            }
+        }
+
+        // ── Activity tracking (skip render when water is still) ─────────
+        let hasActivity = false;
+        let idleFrames = 0;
+        let activityMinX = PW, activityMinY = PH, activityMaxX = 0, activityMaxY = 0;
+
+        // ── Hand tracking state ──────────────────────────────────────────
         let hands;
         let handLandmarks = [];
         let prevHandPoints = {};
         let isReady = false;
 
-        // Hand connections for drawing skeleton
         const HAND_CONNECTIONS = [
-            [0, 1], [1, 2], [2, 3], [3, 4], // Thumb
-            [0, 5], [5, 6], [6, 7], [7, 8], // Index
-            [5, 9], [9, 10], [10, 11], [11, 12], // Middle
-            [9, 13], [13, 14], [14, 15], [15, 16], // Ring
-            [13, 17], [17, 18], [18, 19], [19, 20], // Pinky
-            [0, 17] // Palm base
+            [0, 1], [1, 2], [2, 3], [3, 4],
+            [0, 5], [5, 6], [6, 7], [7, 8],
+            [5, 9], [9, 10], [10, 11], [11, 12],
+            [9, 13], [13, 14], [14, 15], [15, 16],
+            [13, 17], [17, 18], [18, 19], [19, 20],
+            [0, 17]
         ];
+
+        // ── Ambient wave ─────────────────────────────────────────────────
+        let ambientTime = 0;
 
         function showError(msg) {
             loadingEl.style.display = 'none';
@@ -155,10 +182,7 @@
                 });
                 video.srcObject = stream;
                 await new Promise((resolve) => {
-                    video.onloadedmetadata = () => {
-                        video.play();
-                        resolve();
-                    };
+                    video.onloadedmetadata = () => { video.play(); resolve(); };
                 });
             } catch (e) {
                 showError(e.message || 'Failed to access camera.');
@@ -168,12 +192,13 @@
 
         async function initMediaPipe() {
             hands = new Hands({
-                locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${file}`
+                locateFile: (file) =>
+                    `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1646424915/${file}`
             });
             hands.setOptions({
                 maxNumFaces: 0,
                 maxNumHands: 2,
-                modelComplexity: 0, // 0 is faster, 1 is more accurate
+                modelComplexity: 0,
                 minDetectionConfidence: 0.5,
                 minTrackingConfidence: 0.5
             });
@@ -182,45 +207,109 @@
             });
         }
 
-        function addDrop(x, y, radius, strength) {
-            x = Math.floor(x);
-            y = Math.floor(y);
-            if (x < 0 || x >= W || y < 0 || y >= H) return;
-            
-            for (let dy = -radius; dy <= radius; dy++) {
-                for (let dx = -radius; dx <= radius; dx++) {
-                    const distSq = dx * dx + dy * dy;
-                    if (distSq <= radius * radius) {
-                        const px = x + dx;
-                        const py = y + dy;
-                        if (px > 0 && px < W - 1 && py > 0 && py < H - 1) {
-                            const dist = Math.sqrt(distSq);
-                            // Smooth cosine falloff for softer edges
-                            const falloff = (Math.cos((dist / radius) * Math.PI) + 1) * 0.5;
-                            buf1[py * W + px] -= strength * falloff;
-                        }
+        // ── Optimized ripple injection (precomputed kernel) ─────────────
+        function addDrop(px, py, strength) {
+            const cx = Math.round(px);
+            const cy = Math.round(py);
+            const r = MAX_RADIUS;
+
+            for (let dy = -r; dy <= r; dy++) {
+                const ty = cy + dy;
+                if (ty < EDGE || ty >= PH - EDGE) continue;
+                const rowBase = ty * PW;
+                const kRow = (dy + r) * kernelW;
+                for (let dx = -r; dx <= r; dx++) {
+                    const k = dropKernel[kRow + (dx + r)];
+                    if (k > 0) {
+                        const tx = cx + dx;
+                        if (tx < EDGE || tx >= PW - EDGE) continue;
+                        buf1[rowBase + tx] -= strength * k;
                     }
                 }
             }
+
+            // Track activity region for early-out optimization
+            hasActivity = true;
+            idleFrames = 0;
+            activityMinX = Math.max(0, activityMinX, cx - r - 4);
+            activityMinY = Math.max(0, activityMinY, cy - r - 4);
+            activityMaxX = Math.min(PW - 1, activityMaxX, cx + r + 4);
+            activityMaxY = Math.min(PH - 1, activityMaxY, cy + r + 4);
         }
 
+        // ── Wave propagation (physics resolution) ───────────────────────
         function processRipples() {
-            // Update physics
-            for (let i = W; i < size - W; i++) {
-                if (i % W === 0 || i % W === W - 1) continue; // Skip edges
-                buf2[i] = ((buf1[i - 1] + buf1[i + 1] + buf1[i - W] + buf1[i + W]) * 0.5) - buf2[i];
-                buf2[i] *= damping;
+            if (!hasActivity) return;
+
+            // Expand activity bounds slightly each frame (waves spread)
+            const x0 = Math.max(EDGE, activityMinX - 2);
+            const y0 = Math.max(EDGE, activityMinY - 2);
+            const x1 = Math.min(PW - EDGE, activityMaxX + 2);
+            const y1 = Math.min(PH - EDGE, activityMaxY + 2);
+
+            let newMax = 0;
+            let newMinX = PW, newMinY = PH, newMaxX = 0, newMaxY = 0;
+
+            for (let y = y0; y < y1; y++) {
+                const row = y * PW;
+                for (let x = x0; x < x1; x++) {
+                    const i = row + x;
+                    // Standard 4-neighbor wave propagation
+                    const avg = (buf1[i - 1] + buf1[i + 1] + buf1[i - PW] + buf1[i + PW]) * 0.5;
+                    const val = (avg - buf2[i]) * DAMPING;
+                    buf2[i] = val;
+
+                    const abs = val < 0 ? -val : val;
+                    if (abs > 0.2) {
+                        newMax = Math.max(newMax, abs);
+                        if (x < newMinX) newMinX = x;
+                        if (y < newMinY) newMinY = y;
+                        if (x > newMaxX) newMaxX = x;
+                        if (y > newMaxY) newMaxY = y;
+                    }
+                }
             }
+
             // Swap buffers
-            let temp = buf1;
+            const temp = buf1;
             buf1 = buf2;
             buf2 = temp;
+
+            if (newMax < 0.2) {
+                idleFrames++;
+                if (idleFrames > 30) hasActivity = false;
+            } else {
+                idleFrames = 0;
+                activityMinX = newMinX;
+                activityMinY = newMinY;
+                activityMaxX = newMaxX;
+                activityMaxY = newMaxY;
+            }
         }
 
+        // ── Bilinear sample of physics buffer at display resolution ─────
+        function samplePhysics(fx, fy) {
+            // fx, fy in physics space (0..PW, 0..PH)
+            const ix0 = Math.floor(fx);
+            const iy0 = Math.floor(fy);
+            const ix1 = Math.min(ix0 + 1, PW - 1);
+            const iy1 = Math.min(iy0 + 1, PH - 1);
+            const tx = fx - ix0;
+            const ty = fy - iy0;
+
+            const a = buf1[iy0 * PW + ix0];
+            const b = buf1[iy0 * PW + ix1];
+            const c = buf1[iy1 * PW + ix0];
+            const d = buf1[iy1 * PW + ix1];
+
+            return (a * (1 - tx) + b * tx) * (1 - ty) + (c * (1 - tx) + d * tx) * ty;
+        }
+
+        // ── Render with water refraction, caustics & specular ───────────
         function renderFrame() {
             if (!isReady) return;
 
-            // 1. Draw mirrored video to offscreen canvas
+            // 1. Draw mirrored video to offscreen
             offCtx.save();
             offCtx.scale(-1, 1);
             offCtx.drawImage(video, -W, 0, W, H);
@@ -228,86 +317,139 @@
 
             const srcImgData = offCtx.getImageData(0, 0, W, H);
             const srcData = new Uint32Array(srcImgData.data.buffer);
-            
+
             const dstImgData = ctx.createImageData(W, H);
             const dstData = new Uint32Array(dstImgData.data.buffer);
 
-            // 2. Apply water displacement
+            ambientTime += 0.016;
+
+            // 2. Per-pixel water displacement (display resolution)
             for (let y = 1; y < H - 1; y++) {
                 for (let x = 1; x < W - 1; x++) {
                     const i = y * W + x;
-                    
-                    // Calculate gradient
-                    const xoff = Math.floor(buf1[i - 1] - buf1[i + 1]);
-                    const yoff = Math.floor(buf1[i - W] - buf1[i + W]);
 
-                    let srcX = x + xoff;
-                    let srcY = y + yoff;
+                    // Map display coords → physics space
+                    const pfx = x / scaleX;
+                    const pfy = y / scaleY;
 
-                    // Clamp
-                    if (srcX < 0) srcX = 0;
-                    if (srcX >= W) srcX = W - 1;
-                    if (srcY < 0) srcY = 0;
-                    if (srcY >= H) srcY = H - 1;
+                    // Bilinear sample for smooth gradient
+                    const gl = samplePhysics(pfx - 0.5, pfy);
+                    const gr = samplePhysics(pfx + 0.5, pfy);
+                    const gu = samplePhysics(pfx, pfy - 0.5);
+                    const gd = samplePhysics(pfx, pfy + 0.5);
 
-                    // Add slight shading based on displacement for realism
-                    let pixel = srcData[srcY * W + srcX];
-                    
-                    let r = (pixel & 0xff);
-                    let g = ((pixel >> 8) & 0xff);
-                    let b = ((pixel >> 16) & 0xff);
-                    
-                    // Shading based on gradient (simulates light reflection/refraction)
-                    let shade = (xoff + yoff) * 0.3; // More subtle shading for clearer transparency
-                    r = Math.min(255, Math.max(0, r + shade));
-                    g = Math.min(255, Math.max(0, g + shade));
-                    b = Math.min(255, Math.max(0, b + shade));
-                    
+                    const xoff = (gl - gr) * 2.0;
+                    const yoff = (gu - gd) * 2.0;
+                    const amplitude = samplePhysics(pfx, pfy);
+                    const absAmp = amplitude < 0 ? -amplitude : amplitude;
+
+                    // ── Skip pixels with no water effect ──
+                    if (absAmp < 0.15 && xoff === 0 && yoff === 0) {
+                        dstData[i] = srcData[i];
+                        continue;
+                    }
+
+                    // Refracted source coordinates
+                    let srcX = x + xoff * 3.0;
+                    let srcY = y + yoff * 3.0;
+                    srcX = srcX < 0 ? 0 : (srcX >= W ? W - 1 : srcX);
+                    srcY = srcY < 0 ? 0 : (srcY >= H ? H - 1 : srcY);
+
+                    const srcI = (srcY | 0) * W + (srcX | 0);
+                    let pixel = srcData[srcI];
+
+                    let r = pixel & 0xff;
+                    let g = (pixel >> 8) & 0xff;
+                    let b = (pixel >> 16) & 0xff;
+
+                    // ── Water color tint (blue-cyan) ──
+                    const tint = absAmp * 0.015;
+                    r = (r * (1 - tint)) | 0;
+                    g = (g * (1 - tint * 0.5)) | 0;
+                    b = Math.min(255, b + absAmp * 4) | 0;
+
+                    // ── Caustic light (Laplacian = converging light) ──
+                    const laplacian = (gl + gr + gu + gd) * 0.25 - amplitude;
+                    const caustic = laplacian > 0 ? laplacian * 80 : 0;
+                    if (caustic > 0) {
+                        const c = Math.min(60, caustic);
+                        r = Math.min(255, r + c);
+                        g = Math.min(255, g + c * 1.1);
+                        b = Math.min(255, b + c * 0.7);
+                    }
+
+                    // ── Specular highlights on ripple peaks ──
+                    const waveHeight = -amplitude; // upward peaks
+                    if (waveHeight > 1.5) {
+                        const spec = Math.min(50, (waveHeight - 1.5) * 18);
+                        r = Math.min(255, r + spec);
+                        g = Math.min(255, g + spec * 0.95);
+                        b = Math.min(255, b + spec * 0.85);
+                    }
+
+                    // ── Subtle edge shadow on troughs ──
+                    if (amplitude > 1.0) {
+                        const shadow = Math.min(30, (amplitude - 1.0) * 10);
+                        r = Math.max(0, r - shadow);
+                        g = Math.max(0, g - shadow * 0.8);
+                        b = Math.max(0, b - shadow);
+                    }
+
+                    r = r < 0 ? 0 : (r > 255 ? 255 : r);
+                    g = g < 0 ? 0 : (g > 255 ? 255 : g);
+                    b = b < 0 ? 0 : (b > 255 ? 255 : b);
+
                     dstData[i] = (255 << 24) | (b << 16) | (g << 8) | r;
                 }
             }
 
-            // 3. Put displaced image to main canvas
             ctx.putImageData(dstImgData, 0, 0);
 
-            // 4. Handle hands and draw skeleton
+            // ── Draw water-colored hand skeleton ──
             if (handLandmarks.length > 0) {
                 const currentHandPoints = {};
                 handLandmarks.forEach((landmarks, handIdx) => {
-                    // Add ripples at fingertips only (removed palm base to avoid center circle)
-                    const triggerPoints = [4, 8, 12, 16, 20]; 
+                    const triggerPoints = [4, 8, 12, 16, 20];
                     triggerPoints.forEach(idx => {
                         const lm = landmarks[idx];
-                        // Mirror X because we mirrored the video
                         const cx = (1 - lm.x) * W;
                         const cy = lm.y * H;
-                        
+                        const pfx = cx / scaleX;
+                        const pfy = cy / scaleY;
+
                         const pointId = handIdx + '_' + idx;
-                        currentHandPoints[pointId] = {x: cx, y: cy};
-                        
-                        // Interpolate from previous position for continuous fluid flow
+                        currentHandPoints[pointId] = { x: cx, y: cy, pfx, pfy };
+
+                        // Velocity-based strength: faster movement = bigger splash
+                        let strength = 10;
+                        let radiusPx = 8;
                         if (prevHandPoints[pointId]) {
-                            const px = prevHandPoints[pointId].x;
-                            const py = prevHandPoints[pointId].y;
-                            const dist = Math.hypot(cx - px, cy - py);
-                            const steps = Math.max(1, Math.floor(dist / 4));
-                            
-                            for (let i = 0; i <= steps; i++) {
-                                const ix = px + (cx - px) * (i / steps);
-                                const iy = py + (cy - py) * (i / steps);
-                                addDrop(ix, iy, 16, 12); 
+                            const px = prevHandPoints[pointId].pfx;
+                            const py = prevHandPoints[pointId].pfy;
+                            const dist = Math.hypot(pfx - px, pfy - py);
+                            const velocity = dist * 60; // approx pixels/sec in physics space
+                            strength = 6 + Math.min(20, velocity * 3);
+                            radiusPx = 6 + Math.min(6, velocity);
+
+                            const steps = Math.max(1, (dist * 3) | 0);
+                            for (let s = 0; s <= steps; s++) {
+                                const t = s / steps;
+                                addDrop(px + (pfx - px) * t, py + (pfy - py) * t, strength);
                             }
                         } else {
-                            addDrop(cx, cy, 16, 12);
+                            addDrop(pfx, pfy, strength);
                         }
                     });
 
-                    // Draw connections
-                    ctx.strokeStyle = 'rgba(0, 229, 255, 0.3)';
-                    ctx.lineWidth = 2;
+                    // Hand skeleton — water-colored translucent
+                    ctx.save();
+                    ctx.strokeStyle = 'rgba(64, 200, 224, 0.25)';
+                    ctx.lineWidth = 1.8;
                     ctx.lineCap = 'round';
                     ctx.lineJoin = 'round';
-                    
+                    ctx.shadowColor = 'rgba(0, 200, 255, 0.3)';
+                    ctx.shadowBlur = 6;
+
                     HAND_CONNECTIONS.forEach(([i, j]) => {
                         const p1 = landmarks[i];
                         const p2 = landmarks[j];
@@ -317,13 +459,15 @@
                         ctx.stroke();
                     });
 
-                    // Draw joints
-                    ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
+                    // Joints — subtle glow dots
+                    ctx.shadowBlur = 4;
+                    ctx.fillStyle = 'rgba(180, 240, 255, 0.4)';
                     landmarks.forEach((lm) => {
                         ctx.beginPath();
-                        ctx.arc((1 - lm.x) * W, lm.y * H, 3, 0, 2 * Math.PI);
+                        ctx.arc((1 - lm.x) * W, lm.y * H, 2.5, 0, Math.PI * 2);
                         ctx.fill();
                     });
+                    ctx.restore();
                 });
                 prevHandPoints = currentHandPoints;
             } else {
@@ -331,10 +475,10 @@
             }
         }
 
+        // ── Main loop ────────────────────────────────────────────────────
         let lastVideoTime = -1;
         async function loop() {
             if (video.readyState >= 2) {
-                // Throttle MediaPipe processing to video framerate
                 if (video.currentTime !== lastVideoTime) {
                     lastVideoTime = video.currentTime;
                     try {
@@ -344,38 +488,80 @@
                     }
                 }
             }
-            
+
             processRipples();
             renderFrame();
-            
             requestAnimationFrame(loop);
         }
 
-        // Mouse/Touch Interaction for water
-        function handleInput(e) {
-            if (!isReady) return;
-            e.preventDefault();
+        // ── Mouse / Touch ────────────────────────────────────────────────
+        function getCanvasXY(e) {
             const rect = canvas.getBoundingClientRect();
-            const scaleX = canvas.width / rect.width;
-            const scaleY = canvas.height / rect.height;
-
-            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-
-            const x = (clientX - rect.left) * scaleX;
-            const y = (clientY - rect.top) * scaleY;
-            
-            addDrop(x, y, 18, 60);
+            const sx = canvas.width / rect.width;
+            const sy = canvas.height / rect.height;
+            const cx = e.touches ? e.touches[0].clientX : e.clientX;
+            const cy = e.touches ? e.touches[0].clientY : e.clientY;
+            return {
+                x: (cx - rect.left) * sx / scaleX,
+                y: (cy - rect.top) * sy / scaleY
+            };
         }
 
-        canvas.addEventListener('mousedown', handleInput, { passive: false });
-        canvas.addEventListener('mousemove', (e) => {
-            if (e.buttons === 1) handleInput(e);
+        let mouseDown = false;
+        let lastMouse = null;
+        canvas.addEventListener('mousedown', (e) => {
+            if (!isReady) return;
+            e.preventDefault();
+            mouseDown = true;
+            const p = getCanvasXY(e);
+            lastMouse = p;
+            addDrop(p.x, p.y, 50);
         }, { passive: false });
-        canvas.addEventListener('touchstart', handleInput, { passive: false });
-        canvas.addEventListener('touchmove', handleInput, { passive: false });
 
-        // Resize handling
+        canvas.addEventListener('mousemove', (e) => {
+            if (!mouseDown || !isReady) return;
+            e.preventDefault();
+            const p = getCanvasXY(e);
+            if (lastMouse) {
+                const dist = Math.hypot(p.x - lastMouse.x, p.y - lastMouse.y);
+                const steps = Math.max(1, (dist * 2) | 0);
+                for (let s = 0; s <= steps; s++) {
+                    const t = s / steps;
+                    addDrop(lastMouse.x + (p.x - lastMouse.x) * t, lastMouse.y + (p.y - lastMouse.y) * t, 35);
+                }
+            }
+            lastMouse = p;
+        }, { passive: false });
+
+        canvas.addEventListener('mouseup', () => { mouseDown = false; lastMouse = null; });
+        canvas.addEventListener('mouseleave', () => { mouseDown = false; lastMouse = null; });
+
+        canvas.addEventListener('touchstart', (e) => {
+            if (!isReady) return;
+            e.preventDefault();
+            const p = getCanvasXY(e);
+            lastMouse = p;
+            addDrop(p.x, p.y, 50);
+        }, { passive: false });
+
+        canvas.addEventListener('touchmove', (e) => {
+            if (!isReady) return;
+            e.preventDefault();
+            const p = getCanvasXY(e);
+            if (lastMouse) {
+                const dist = Math.hypot(p.x - lastMouse.x, p.y - lastMouse.y);
+                const steps = Math.max(1, (dist * 2) | 0);
+                for (let s = 0; s <= steps; s++) {
+                    const t = s / steps;
+                    addDrop(lastMouse.x + (p.x - lastMouse.x) * t, lastMouse.y + (p.y - lastMouse.y) * t, 35);
+                }
+            }
+            lastMouse = p;
+        }, { passive: false });
+
+        canvas.addEventListener('touchend', () => { lastMouse = null; });
+
+        // ── Resize ───────────────────────────────────────────────────────
         function resize() {
             const aspect = W / H;
             const windowAspect = window.innerWidth / window.innerHeight;
@@ -390,16 +576,14 @@
         window.addEventListener('resize', resize);
         resize();
 
-        // Boot sequence
+        // ── Boot ─────────────────────────────────────────────────────────
         async function boot() {
             try {
                 await startCamera();
                 await initMediaPipe();
-                
                 isReady = true;
                 loadingEl.style.opacity = '0';
                 setTimeout(() => loadingEl.style.display = 'none', 500);
-                
                 requestAnimationFrame(loop);
             } catch (e) {
                 console.error(e);
@@ -407,7 +591,6 @@
         }
 
         boot();
-
     </script>
 </body>
 </html>
